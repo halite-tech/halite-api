@@ -1,0 +1,133 @@
+# Industry benchmarks used by the Cost and Time engines.
+#
+# Every value has low / typical / high. The engines run once per scenario:
+# "typical" is the headline number, and the spread across the three runs
+# becomes the low-high range shown to the owner (and the sensitivity check).
+#
+# IMPORTANT: these are placeholder values for the hackathon prototype. Each
+# entry needs a citation (e.g. National Restaurant Association operations
+# reports, POS-vendor industry benchmark reports, BLS) before production use.
+# `source: TODO` marks values that still need one.
+
+values:
+  # --- Inventory and waste ---------------------------------------------------
+  allowed_food_variance_pct:   # actual vs theoretical food cost, share of theoretical
+    {low: 0.01, typical: 0.02, high: 0.03, source: TODO}
+  waste_pct_of_purchases:      # achievable waste target, share of food purchases
+    {low: 0.03, typical: 0.04, high: 0.05, source: TODO}
+  target_days_on_hand:
+    {low: 5, typical: 7, high: 10, source: TODO}
+  carrying_cost_rate:          # annual cost of holding inventory, share of value
+    {low: 0.20, typical: 0.225, high: 0.25, source: TODO}
+  stockout_substitution_rate:  # share of guests who order something else when an item is 86'd
+    {low: 0.5, typical: 0.6, high: 0.7, source: TODO}
+  fallback_food_cost_pct:      # used for item margin when recipes are missing
+    {low: 0.28, typical: 0.30, high: 0.32, source: TODO}
+
+  # --- Purchasing and suppliers ---------------------------------------------
+  price_creep_tolerance:       # price increase over the SKU's reference price that is ignored
+    {low: 0.01, typical: 0.02, high: 0.03, source: TODO}
+  emergency_purchase_premium:  # used only when the SKU has no reference price
+    {low: 0.10, typical: 0.15, high: 0.25, source: TODO}
+  late_delivery_grace_hours:
+    {low: 1, typical: 2, high: 4, source: TODO}
+
+  # --- Labor scheduling ------------------------------------------------------
+  target_splh:                 # sales per labor hour the schedule should hit
+    {low: 50, typical: 55, high: 60, source: TODO}
+  min_staff_per_hour: 2
+  overtime_weekly_threshold: 40
+  overtime_premium: 0.5
+  slow_ticket_minutes:
+    {low: 20, typical: 25, high: 30, source: TODO}
+  walkaway_rate:               # share of slow-ticket guests lost (now or as repeat business)
+    {low: 0.03, typical: 0.05, high: 0.08, source: TODO}
+
+  # --- Hiring and retention --------------------------------------------------
+  target_turnover_rate:        # industry average is roughly 75% per year
+    {low: 0.6, typical: 0.7, high: 0.8, source: TODO}
+  recruiting_cost_per_hire:
+    {low: 300, typical: 500, high: 800, source: TODO}
+  training_hours_per_hire:
+    {low: 15, typical: 20, high: 30, source: TODO}
+  ramp_productivity_loss_per_hire:
+    {low: 500, typical: 800, high: 1200, source: TODO}
+  fallback_hourly_wage: 15
+  target_days_to_fill:
+    {low: 10, typical: 14, high: 21, source: TODO}
+  coverage_cost_per_open_day:  # overtime or lost capacity while a role is vacant
+    {low: 40, typical: 60, high: 90, source: TODO}
+
+  # --- Order channels --------------------------------------------------------
+  direct_ordering_cost_pct:    # cost of a commission-free online ordering channel
+    {low: 0.03, typical: 0.05, high: 0.08, source: TODO}
+  shiftable_order_share:       # share of marketplace orders that could move to direct
+    {low: 0.20, typical: 0.25, high: 0.35, source: TODO}
+
+  # --- POS / revenue leakage -------------------------------------------------
+  pos_leakage_pct:             # voids + comps + discounts, share of gross sales
+    {low: 0.015, typical: 0.02, high: 0.03, source: TODO}
+  target_item_food_cost_pct:
+    {low: 0.30, typical: 0.32, high: 0.35, source: TODO}
+  cash_variance_allowance_pct:
+    {low: 0.0005, typical: 0.001, high: 0.002, source: TODO}
+
+  # --- Guest experience and marketing ---------------------------------------
+  target_noshow_rate:
+    {low: 0.03, typical: 0.05, high: 0.07, source: TODO}
+  unfilled_seat_share:         # share of no-show seats that are not resold
+    {low: 0.5, typical: 0.6, high: 0.8, source: TODO}
+  target_rating:
+    {low: 4.2, typical: 4.3, high: 4.4, source: TODO}
+  revenue_per_star:            # revenue change per 1-star rating change (Luca 2016: 5-9%)
+    {low: 0.05, typical: 0.07, high: 0.09, source: "Luca, M. (2016) Reviews, Reputation, and Revenue: The Case of Yelp.com"}
+  marketing_gross_margin:      # contribution margin on attributed revenue
+    {low: 0.60, typical: 0.65, high: 0.70, source: TODO}
+
+  # --- Facilities ------------------------------------------------------------
+  utilities_per_sqft_year:
+    {low: 6, typical: 8, high: 10, source: TODO}
+  downtime_lost_sales_share:
+    {low: 0.2, typical: 0.3, high: 0.5, source: TODO}
+
+  # --- Time engine: manual minutes per unit of work -------------------------
+  schedule_min_per_shift:        {low: 2, typical: 3, high: 5, source: TODO}
+  count_min_per_sku:             {low: 0.5, typical: 1, high: 1.5, source: TODO}
+  order_min_per_po:              {low: 10, typical: 15, high: 25, source: TODO}
+  invoice_min_per_invoice:       {low: 3, typical: 5, high: 8, source: TODO}
+  invoice_discrepancy_min:       {low: 15, typical: 20, high: 30, source: TODO}
+  payroll_min_per_employee_period: {low: 3, typical: 5, high: 8, source: TODO}
+  pay_periods_per_year: 26
+  screening_min_per_applicant:   {low: 5, typical: 8, high: 12, source: TODO}
+  interview_min:                 {low: 30, typical: 45, high: 60, source: TODO}
+  onboarding_hours_per_hire:     {low: 3, typical: 4, high: 6, source: TODO}
+  review_response_min:           {low: 3, typical: 5, high: 8, source: TODO}
+  bookkeeping_base_hours_week:   {low: 2, typical: 3, high: 4, source: TODO}
+  bookkeeping_min_per_1000_txn:  {low: 10, typical: 15, high: 20, source: TODO}
+  late_delivery_followup_min:    {low: 15, typical: 20, high: 30, source: TODO}
+  kitchen_target_minutes:        {low: 15, typical: 18, high: 20, source: TODO}
+  table_turn_target_minutes:     {low: 60, typical: 70, high: 80, source: TODO}
+
+# Share of a problem's loss that an AI tool can realistically recover.
+# Judgment calls - shown openly in the report.
+addressability:
+  inventory_waste: 0.40
+  purchasing_suppliers: 0.50
+  labor_scheduling: 0.50
+  hiring_retention: 0.35
+  order_channels: 0.50
+  pos_leakage: 0.30
+  guest_marketing: 0.30
+  back_office_admin: 0.60
+  facilities: 0.25
+
+# Share of manual task time a typical tool removes ("hours at target").
+tool_savings:
+  scheduling: 0.70
+  inventory_count: 0.50
+  ordering: 0.60
+  invoices: 0.70
+  payroll: 0.60
+  hiring: 0.50
+  reviews: 0.60
+  bookkeeping: 0.50
