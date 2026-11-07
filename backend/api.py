@@ -16,6 +16,7 @@ from backend.ingest.loader import build_dataset
 from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
+from backend.tool_rec.llmConnection import get_tools
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -85,3 +86,13 @@ def _demo_analysis() -> Analysis:
 @app.get("/demo")
 def demo(alpha: float = Alpha):
     return build_report(_demo_analysis(), alpha)
+
+@app.get("/tools")
+def tools():
+    tool_rec = None
+    try:
+        build_report_json = demo()
+        tool_recs = get_tools(problems=build_report_json['restaurant']['top_problems'])
+    except Exception as e:
+        raise HTTPException(500, f"Error getting tools: {e}")
+    return tool_recs
