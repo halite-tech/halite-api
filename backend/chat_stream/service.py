@@ -24,8 +24,9 @@ from backend.shared.debug import debug, debug_trim
 from backend.tool_rec.llmConnection import get_tools
 
 MIN_ROUNDS = 3  # owner answers required on a problem before it can count as understood
-MAX_OWNER_TURNS_BEFORE_TOOLS = 4  # else launch tools with whatever context was collected
+MAX_OWNER_TURNS_BEFORE_TOOLS = 3  # else launch tools with whatever context was collected
 UNDERSTOOD_CLARITY = 85
+LOOKING_FOR_TOOLS_MSG = "Looking for tools…"
 MAX_CONTEXT_MESSAGES = 30  # messages of the current problem sent to the model
 EXTRACTOR_WINDOW = 12
 
@@ -137,7 +138,7 @@ def _should_launch_tools(session: ChatSession) -> bool:
     return True
 
 
-def launch_tools(session: ChatSession) -> None:
+def launch_tools(session: ChatSession) -> asyncio.Task[None]:
     session.tools_run += 1
     brief = problem_brief(session)
     session.tools = ToolsState("running", brief, updated_at=time.time())
@@ -148,7 +149,14 @@ def launch_tools(session: ChatSession) -> None:
     )
     task = asyncio.create_task(_tools_job(session, session.tools_run, brief))
     _BACKGROUND.add(task)
-    task.add_done_callback(_BACKGROUND.discard)
+
+    def _done(t: asyncio.Task[None]) -> None:
+        _BACKGROUND.discard(t)
+        if not t.cancelled() and (exc := t.exception()):
+            debug("chat/tools", f"session={session.id} background task failed: {exc!r}")
+
+    task.add_done_callback(_done)
+    return task
 
 
 def _tools_status(session: ChatSession) -> dict:
@@ -162,6 +170,15 @@ def _apply_analysis(session: ChatSession, analysis: dict, user_message: str) -> 
     previous = session.problem
     action = analysis["action"] if previous else "new_problem"
     statement = (analysis["problem"] or "").strip()
+    facts = [str(f) for f in analysis["known_facts"]]
+    if previous and action == "new_problem" and not analysis.get("explicit_switch"):
+        # The extractor tends to mistake background answers ("60 seats, we use Toast") for a new
+        # problem. That would wipe the context and reset the turn counter, so the chat would never
+        # reach the tools step. Only an explicit switch may replace the problem.
+        debug("chat", f"session={session.id} ignoring new_problem without explicit_switch -> refine")
+        action = "refine"
+        statement = previous
+        facts = list(dict.fromkeys([*session.known_facts, *facts]))
     if action == "keep" or not statement:
         statement = previous or user_message.strip()[:300]
     changed = statement != previous
@@ -184,7 +201,7 @@ def _apply_analysis(session: ChatSession, analysis: dict, user_message: str) -> 
              and session.focus_user_turns >= MIN_ROUNDS)
     session.clarity = clarity if ready else min(clarity, UNDERSTOOD_CLARITY - 1)
     session.understood = ready
-    session.known_facts = [str(f) for f in analysis["known_facts"]]
+    session.known_facts = facts
     session.open_questions = [str(q) for q in analysis["open_questions"]]
     return action, previous, changed
 
@@ -219,15 +236,32 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
         f"session={session.id} applied action={action} switched={switched} changed={changed} "
         f"turns={session.focus_user_turns} understood={session.understood} (was {was_understood})",
     )
+    launch_tools_now = _should_launch_tools(session)
+    if launch_tools_now:
+        # Context is complete enough for tooling — full clarity in the UI and wrap-up grilling.
+        session.clarity = 100
+        session.understood = True
+
     yield _event("state", {**session.state(), "action": action, "previous_problem": previous})
 
-    if _should_launch_tools(session):
-        reason = "understood" if session.understood else f">={MAX_OWNER_TURNS_BEFORE_TOOLS}_turns"
+    parts: list[str] = []
+    messages = [{"role": "system", "content": _system_prompt(session, switched)}]
+    messages += session.focus_messages[-MAX_CONTEXT_MESSAGES:]
+
+    if launch_tools_now:
+        reason = "understood" if was_understood or analysis.get("understood") else f">={MAX_OWNER_TURNS_BEFORE_TOOLS}_turns"
         debug(
             "chat",
-            f"session={session.id} launch_tools reason={reason} turns={session.focus_user_turns}",
+            f"session={session.id} launch_tools reason={reason} turns={session.focus_user_turns} clarity=100",
         )
-        launch_tools(session)
+        tools_task = launch_tools(session)
+        yield _event("tools", _tools_status(session))
+        session.log("assistant", LOOKING_FOR_TOOLS_MSG, problem_version=session.problem_version)
+        yield _event("notice", {"text": LOOKING_FOR_TOOLS_MSG})
+        try:
+            await tools_task
+        except Exception as exc:  # noqa: BLE001
+            debug("chat", f"session={session.id} tools task failed: {exc}")
         yield _event("tools", _tools_status(session))
     else:
         debug(
@@ -237,10 +271,6 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
             f"understood={session.understood} tools={session.tools.status}",
         )
 
-    messages = [{"role": "system", "content": _system_prompt(session, switched)}]
-    messages += session.focus_messages[-MAX_CONTEXT_MESSAGES:]
-
-    parts: list[str] = []
     try:
         async for delta in stream_chat(messages):
             parts.append(delta)

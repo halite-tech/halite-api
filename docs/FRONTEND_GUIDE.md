@@ -276,7 +276,7 @@ A chat where an AI interrogator drills the owner on **one problem at a time** un
 How it behaves:
 
 - Only **one problem is in focus**. When the owner switches topic, the backend **drops the old problem and its working context**, adopts the new one, and clears prior tool results (`tools.status` → `idle`) until enough context is collected again.
-- **Tool research** (`get_tools` on `problem` + `known_facts`) starts only after **either** the extractor marks the problem **`understood: true`** **or** the owner has sent **4 messages** on the current problem (whichever comes first). Earlier turns are grill-only (no SSE `tools` event).
+- **Tool research** (`get_tools` on `problem` + `known_facts`) starts only after **either** the extractor marks the problem **`understood: true`** **or** the owner has sent **3 messages** on the current problem (whichever comes first). Earlier turns are grill-only (no SSE `tools` event). When research starts, the server sets **`clarity: 100`** and **`understood: true`** on that turn’s `state` event (even if the model scored lower).
 - The transcript is never wiped: a switch is recorded as a message with `role: "event"` and `type: "problem_changed"` so the UI can draw a divider.
 - A problem only becomes `understood: true` after **≥ 3 owner answers** on it and `clarity ≥ 85`.
 - Sessions live in server memory (lost on restart, like `dataset_id`).
@@ -336,8 +336,9 @@ Events, in order:
 | Event | When | Payload |
 |-------|------|---------|
 | `state` | Right after the message is analysed (before any text) | `problem`, `problem_version`, `understood`, `clarity` (0–100), `known_facts[]`, `open_questions[]`, `action` (`keep` \| `refine` \| `new_problem`), `previous_problem` |
-| `tools` | Only when tool research was just (re)started | `status: "running"`, `problem` (the exact brief sent to the tools pipeline) |
-| `token` | Many times | `delta` — append to the assistant bubble |
+| `tools` | When research **starts** (`status: "running"`) and again when it **finishes** (`ready` or `error`) on the same SSE connection | `status`, `problem` (brief); no `result` — poll GET for JSON |
+| `notice` | Once, right after tools start on that turn | `{ "text": "Looking for tools…" }` — show as its own assistant line (also in `messages[]`) |
+| `token` | After `notice` + tools `ready`/`error` (if research ran); otherwise immediately after `state` | `delta` — second assistant bubble (wrap-up / follow-up question) |
 | `done` | End of stream | `state`, `tools` (status only, no result) |
 | `error` | Analysis or stream failed | `message` — `done` may still follow |
 
@@ -345,7 +346,7 @@ Use `state` to update a "Current problem" header and a clarity meter immediately
 
 ### 3. Poll for tool recommendations
 
-Tools run **30–90+ s after** the stream ends, so poll `GET /chat/sessions/{id}` every 2–3 s while `tools.status === "running"`:
+On the turn where research starts, the SSE stream **blocks** until `get_tools` finishes: you get `notice` → wait → second `tools` (`ready`/`error`) → then grilling `token`s. Poll `GET /chat/sessions/{id}` for `tools.result` once `status === "ready"` (same connection may already show `ready` before tokens). If the client disconnects mid-wait, poll while `tools.status === "running"`:
 
 ```ts
 type ToolsState = {
@@ -375,7 +376,7 @@ Only show `result` when `tools.problem` matches the current problem; a run for a
 
 Mid-stream failures arrive as SSE `event: error` with `{ message }` (HTTP stays 200). Chat model: `CHAT_STREAM_MODEL` (see env vars at the top).
 
-**When tool research starts** (SSE `tools`, then poll `GET /chat/sessions/{id}`): on the message where **`understood` flips to true** (needs **≥ 3** owner answers and **clarity ≥ 85**) **or** on the **4th** owner message on the current problem if still not understood. Switching problems resets the count and tool state; the grill runs again before the next tooling call. If the brief changes after tools already **ready** for an older brief, research runs again once the threshold is still met.
+**When tool research starts** (SSE `tools`, then poll `GET /chat/sessions/{id}`): on the message where **`understood` flips to true** (needs **≥ 3** owner answers and **clarity ≥ 85**) **or** on the **3rd** owner message on the current problem if still not understood. Switching problems resets the count and tool state; the grill runs again before the next tooling call. If the brief changes after tools already **ready** for an older brief, research runs again once the threshold is still met.
 
 ---
 
@@ -401,6 +402,12 @@ type Session = {
   chat: ChatSession | null; // Stage 5 (independent of the phases above)
 };
 
+type SolutionType = {
+  id: string; // stable id, same as solution_tags entries
+  label: string; // e.g. "POS", "Accounting", "AI / automation"
+  description: string; // one line: what this class of tool is for
+};
+
 type Tool = {
   tool_number: number; // 1-4 within a problem
   tool_name: string;
@@ -408,12 +415,10 @@ type Tool = {
   tool_description: string; // full narrative
   tool_pricing: string;
   tool_home_page: string; // URL, or "Not publicly available"
+  tool_logo_url: string; // derived from homepage host (Clearbit); use favicon/placeholder on 404
   category: "platform_integrated" | "highest_roi";
-  solution_tags: (
-    | "pos" | "payments" | "scheduling" | "inventory" | "delivery" | "reservations"
-    | "marketing" | "loyalty" | "accounting" | "analytics" | "ai_llm" | "automation"
-    | "voice" | "labor" | "waste" | "guest_experience" | "communication" | "other"
-  )[]; // 1–3 chips, e.g. ["pos", "payments"]
+  solution_tags: string[]; // 1–3 ids for filters
+  solution_types: SolutionType[]; // render chips from label + description (parallel to solution_tags)
 };
 
 type ToolRecs = {
@@ -445,6 +450,7 @@ type ChatSession = {
 type ChatEvent =
   | { event: "state"; data: Omit<ChatSession, "session_id" | "messages" | "tools"> & { action: string; previous_problem: string | null } }
   | { event: "tools"; data: Omit<ToolsState, "result"> }
+  | { event: "notice"; data: { text: string } }
   | { event: "token"; data: { delta: string } }
   | { event: "done"; data: { state: unknown; tools: Omit<ToolsState, "result"> } }
   | { event: "error"; data: { message: string } };
@@ -493,7 +499,7 @@ Tooling does **not** accept a custom problem list from the client — it always 
 
 1. `GET /tools`: `await response.json()` → `{ recommendations: [...] }`.
 2. Chat: `tools.result` is already parsed by the backend (same `ToolRecs` object). If it is a **string**, parsing failed — show it as plain text. If `tools.status` is `"error"`, show `tools.error` and offer retry.
-3. **Dashboard** (`GET /tools`): render one section per `recommendations[]` entry (typically aligned with `top_problems`). **Chat** (`tools.result`): usually **one** recommendation for the problem in focus. Group tool cards by `category`; show `final_recommendation` as a callout.
+3. **Dashboard** (`GET /tools`): render one section per `recommendations[]` entry (typically aligned with `top_problems`). **Chat** (`tools.result`): usually **one** recommendation for the problem in focus. Group tool cards by `category`; show `tool_logo_url` beside the name; use `solution_types[].label` / `description` for chips (not raw `solution_tags` ids). Show `final_recommendation` as a callout.
 4. Disclaimer: AI-generated — verify pricing and integrations on vendor sites.
 
 ---

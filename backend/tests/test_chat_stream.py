@@ -42,8 +42,11 @@ def fake_llm(monkeypatch):
     return script, tool_calls, seen_prompts
 
 
-def analysis(action, problem, clarity=30, understood=False, facts=(), questions=("how much?",)):
-    return {"action": action, "problem": problem, "known_facts": list(facts),
+def analysis(action, problem, clarity=30, understood=False, facts=(), questions=("how much?",),
+             explicit_switch=None):
+    if explicit_switch is None:
+        explicit_switch = action == "new_problem"
+    return {"action": action, "explicit_switch": explicit_switch, "problem": problem, "known_facts": list(facts),
             "open_questions": list(questions), "clarity": clarity, "understood": understood}
 
 
@@ -75,11 +78,14 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
 
         script.append(analysis("keep", "Food waste is high", clarity=40, facts=["waste bin full nightly"]))
         send(client, sid, "about 200 lbs a week")
-        script.append(analysis("keep", "Food waste is high", clarity=50, facts=["waste bin full nightly", "200 lbs/wk"]))
-        send(client, sid, "mostly produce")
         script.append(analysis("keep", "Food waste is high", clarity=60, facts=["waste bin full nightly", "200 lbs/wk"]))
-        events = send(client, sid, "we use Toast POS")
-        assert "tools" in [e for e, _ in events]  # 4th owner message -> tooling
+        events = send(client, sid, "mostly produce")
+        names = [e for e, _ in events]
+        assert "tools" in names and "notice" in names  # 3rd owner message -> tooling
+        assert events[0][1]["clarity"] == 100
+        assert events[0][1]["understood"] is True
+        assert any(d.get("text") == service.LOOKING_FOR_TOOLS_MSG for e, d in events if e == "notice")
+        assert names.index("notice") < names.index("token")
         wait_for_tools(client, sid)
         assert len(tool_calls) == 1
         assert "Food waste is high" in tool_calls[-1][0]
@@ -99,9 +105,8 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         assert "Food waste" not in json.dumps(sent)
         assert [m["role"] for m in sent] == ["system", "user"]
 
-        for _ in range(2):
-            script.append(analysis("keep", "Servers no-show constantly", facts=["3 no-shows a month"]))
-            send(client, sid, "more detail")
+        script.append(analysis("keep", "Servers no-show constantly", facts=["3 no-shows a month"]))
+        send(client, sid, "more detail")
         script.append(analysis("keep", "Servers no-show constantly", facts=["3 no-shows a month", "Fridays worst"]))
         events = send(client, sid, "Fridays are the worst")
         assert "tools" in [e for e, _ in events]
@@ -130,9 +135,35 @@ def test_understood_needs_minimum_rounds_then_refreshes_tools(fake_llm):
         script.append(analysis("keep", "Slow ticket times", clarity=95, understood=True))
         events = send(client, sid, "answer 3")
         assert events[0][1]["understood"] is True
-        assert [e for e, _ in events][1] == "tools"  # understood after 3 rounds (before 4-message cap)
+        assert events[0][1]["clarity"] == 100
+        names = [e for e, _ in events]
+        assert names[1] == "tools" and "notice" in names  # understood after 3 rounds (same as message cap)
+        assert names.index("notice") < next(i for i, e in enumerate(names) if e == "token")
         wait_for_tools(client, sid)
         assert len(tool_calls) == 1
+
+
+def test_spurious_new_problem_does_not_reset_context_or_turn_count(fake_llm):
+    """Regression: the extractor mislabelled background answers as new_problem, so the message
+    cap was never reached and the chat grilled forever."""
+    script, tool_calls, _ = fake_llm
+    with TestClient(app) as client:
+        sid = client.post("/chat/sessions").json()["session_id"]
+        script.append(analysis("new_problem", "Traffic is down 50%", facts=["500 customers before"]))
+        send(client, sid, "traffic is down")
+        for i, msg in enumerate(["we have 60 seats", "we use Toast"]):
+            script.append(analysis("new_problem", "Owner describes seats/POS", facts=[f"detail {i}"],
+                                   explicit_switch=False))
+            events = send(client, sid, msg)
+            assert events[0][1]["action"] == "refine"
+            assert events[0][1]["problem"] == "Traffic is down 50%"
+        assert "tools" in [e for e, _ in events]  # 3rd owner message on the same problem
+        wait_for_tools(client, sid)
+        assert len(tool_calls) == 1
+        brief = tool_calls[0][0]
+        assert "Traffic is down 50%" in brief
+        for fact in ["500 customers before", "detail 0", "detail 1"]:
+            assert fact in brief
 
 
 def test_chat_errors(fake_llm, monkeypatch):

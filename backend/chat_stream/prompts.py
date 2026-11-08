@@ -46,18 +46,26 @@ You track the state of a "grill me" interview with a restaurant owner. You are N
 you only analyse the conversation and return JSON.
 
 Decide what the owner's LATEST message does to the problem under discussion:
-- "new_problem": the owner starts with a first problem, switches to a different problem, or asks to \
-change what we are focusing on. (A different root problem or area of the business is a new problem; \
-extra detail about the same problem is not.)
+- "new_problem": the owner states the FIRST problem, or EXPLICITLY drops the current problem for a \
+different one ("forget that", "actually my bigger issue is...") or starts describing a clearly \
+unrelated operational problem. Be very conservative once a problem exists.
 - "refine": same problem, but the message adds or corrects details that change the problem statement.
 - "keep": same problem; the message just answers a question or adds nothing that changes the statement.
+
+IMPORTANT: answers to the interviewer's questions are NEVER a new problem, even when they describe \
+something new-sounding. Background about the business (seats, cuisine, location, POS/software, staff, \
+budget, goals, history, what they already tried, numbers, dates) is "keep" or "refine" of the CURRENT \
+problem. When unsure, choose "refine".
 
 Fields:
 - problem: a concise, specific, third-person statement of the problem currently in focus (1-2 \
 sentences), incorporating confirmed details. For "keep", return the current problem unchanged. For \
 "new_problem", describe ONLY the new problem; carry over nothing from the old one.
+- explicit_switch: true ONLY if the owner clearly abandons the current problem or starts a clearly \
+unrelated one. False for the first problem, for answers, and for any extra background.
 - known_facts: short factual bullet strings the owner has actually stated about THIS problem \
-(numbers, systems, causes, constraints, attempts). For "new_problem", only facts from the latest message.
+(numbers, systems, causes, constraints, attempts). Keep ALL earlier known facts that still apply and \
+add new ones; for a genuine "new_problem", only facts from the latest message.
 - open_questions: the most important things still unknown, as short questions (max 5, most \
 important first). Empty only if the problem is genuinely clear.
 - clarity: integer 0-100. 0-30 = barely described, 31-60 = broad picture but vague or unquantified, \
@@ -70,12 +78,13 @@ EXTRACTOR_SCHEMA = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": ["keep", "refine", "new_problem"]},
+        "explicit_switch": {"type": "boolean"},
         "problem": {"type": "string"},
         "known_facts": {"type": "array", "items": {"type": "string"}},
         "open_questions": {"type": "array", "items": {"type": "string"}},
         "clarity": {"type": "integer"},
         "understood": {"type": "boolean"},
     },
-    "required": ["action", "problem", "known_facts", "open_questions", "clarity", "understood"],
+    "required": ["action", "explicit_switch", "problem", "known_facts", "open_questions", "clarity", "understood"],
     "additionalProperties": False,
 }

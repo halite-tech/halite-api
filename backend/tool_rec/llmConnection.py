@@ -18,6 +18,7 @@ import json
 import os
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -50,6 +51,28 @@ SOLUTION_TAGS = (
     "communication",
     "other",
 )
+
+# Human-facing labels for UI chips (API adds `solution_types` from these + `solution_tags` ids).
+SOLUTION_TAG_META: dict[str, dict[str, str]] = {
+    "pos": {"label": "POS", "description": "Point-of-sale, menus, tickets, and in-store orders"},
+    "payments": {"label": "Payments", "description": "Card processing, payouts, and checkout"},
+    "scheduling": {"label": "Staff scheduling", "description": "Shifts, availability, and labor planning"},
+    "inventory": {"label": "Inventory", "description": "Stock counts, ordering, and vendor management"},
+    "delivery": {"label": "Delivery & off-premise", "description": "Delivery marketplaces and takeout ops"},
+    "reservations": {"label": "Reservations", "description": "Table booking, waitlists, and seating"},
+    "marketing": {"label": "Marketing", "description": "Guest acquisition, ads, and local visibility"},
+    "loyalty": {"label": "Loyalty", "description": "Rewards, retention, and repeat visits"},
+    "accounting": {"label": "Accounting", "description": "Books, P&L, and financial reporting"},
+    "analytics": {"label": "Analytics", "description": "Dashboards, trends, and performance insight"},
+    "ai_llm": {"label": "AI / automation", "description": "LLM assistants, copilots, and smart workflows"},
+    "automation": {"label": "Workflow automation", "description": "Rules-based tasks and integrations"},
+    "voice": {"label": "Voice & phone", "description": "AI phone agents and call handling"},
+    "labor": {"label": "Labor & HR", "description": "Hiring, training, payroll, and compliance"},
+    "waste": {"label": "Waste & sustainability", "description": "Food waste tracking and cost control"},
+    "guest_experience": {"label": "Guest experience", "description": "Reviews, feedback, and service quality"},
+    "communication": {"label": "Team communication", "description": "Staff messaging and internal alerts"},
+    "other": {"label": "Restaurant ops", "description": "General operations software"},
+}
 
 TOOL_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -123,7 +146,9 @@ For **EACH problem**, find exactly **4 AI tools**:
 - 2 **highest_roi** tools with strong cost/revenue impact.
 
 For every tool, research: homepage URL, pricing, how it solves the problem, integrations, ROI, reliability, and adoptability.
-Also classify each tool with 1–3 **solution tags** (e.g. `pos`, `ai_llm`, `scheduling`, `marketing`) and a one-sentence **tagline** for a UI subtitle.
+Also classify each tool with 1–3 **solution_tags** ids that describe what kind of product it is (e.g. `pos` = POS,
+`accounting` = accounting, `ai_llm` = AI assistant) plus a one-sentence **tagline** for a UI subtitle.
+If possible, note a direct **logo** image URL from the vendor site; logos are also derived from the homepage domain.
 Use credible sources only; write "{NOT_AVAILABLE}" when you cannot verify a field.
 The tools must be real, currently available products that are directly relevant to the problem.
 ENSURE THE LINKS ARE VALID AND WORKING.
@@ -151,8 +176,9 @@ Rules:
 - `tool_tagline` is one punchy sentence (under ~25 words) — quick UI intro; not redundant with the name.
 - `tool_description` is the full narrative (what it does, how it solves the problem, integrations,
   ROI, reliability, adoptability).
-- `solution_tags` is 1–3 values from exactly: {", ".join(SOLUTION_TAGS)} — primary product type(s), e.g.
-  Toast → `pos` + `payments`; an AI menu writer → `ai_llm` + `marketing`.
+- `solution_tags` is 1–3 ids from exactly: {", ".join(SOLUTION_TAGS)} — what the product is for, e.g.
+  Toast → `pos` + `payments`; QuickBooks → `accounting`; an AI menu writer → `ai_llm` + `marketing`.
+  Pick tags that match how a restaurant owner would bucket the tool (POS solution, accounting solution, etc.).
 - `tool_pricing` is a short pricing summary; `tool_home_page` is a full URL.
 - Use "{NOT_AVAILABLE}" for any field the notes do not support. Never invent facts.
 
@@ -286,6 +312,36 @@ def _headline(problem: str) -> str:
     return next((ln.strip() for ln in problem.splitlines() if ln.strip()), problem.strip())
 
 
+def _host_from_url(url: str) -> str | None:
+    if not url or url == NOT_AVAILABLE:
+        return None
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    host = (urlparse(url).netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host or None
+
+
+def _logo_url(home_page: str) -> str:
+    """Best-effort brand mark for the UI (Clearbit); frontend may fall back on 404."""
+    host = _host_from_url(home_page)
+    if not host:
+        return NOT_AVAILABLE
+    return f"https://logo.clearbit.com/{host}"
+
+
+def _solution_types(tag_ids: list[str]) -> list[dict[str, str]]:
+    return [
+        {
+            "id": tid,
+            "label": SOLUTION_TAG_META[tid]["label"],
+            "description": SOLUTION_TAG_META[tid]["description"],
+        }
+        for tid in tag_ids
+    ]
+
+
 def _normalize_tags(raw: Any) -> list[str]:
     tags: list[str] = []
     if isinstance(raw, list):
@@ -329,15 +385,22 @@ def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[
                 continue
             category = t.get("category")
             description = _text(t.get("tool_description"), NOT_AVAILABLE)
+            home = _text(t.get("tool_home_page"), NOT_AVAILABLE)
+            tag_ids = _normalize_tags(t.get("solution_tags"))
+            logo = _text(t.get("tool_logo_url"))
+            if not logo or logo == NOT_AVAILABLE:
+                logo = _logo_url(home)
             tools.append({
                 "tool_number": len(tools) + 1,
                 "tool_name": _text(t.get("tool_name")),
                 "tool_tagline": _tagline(t.get("tool_tagline"), description),
                 "tool_description": description,
                 "tool_pricing": _text(t.get("tool_pricing"), NOT_AVAILABLE),
-                "tool_home_page": _text(t.get("tool_home_page"), NOT_AVAILABLE),
+                "tool_home_page": home,
+                "tool_logo_url": logo,
                 "category": category if category in CATEGORIES else "highest_roi",
-                "solution_tags": _normalize_tags(t.get("solution_tags")),
+                "solution_tags": tag_ids,
+                "solution_types": _solution_types(tag_ids),
             })
         recs_out.append({
             "problem": _text(rec.get("problem"), _headline(problem)),

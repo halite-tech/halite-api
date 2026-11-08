@@ -172,9 +172,39 @@ def test_get_tools_normalizes_incomplete_model_output(monkeypatch):
         "tool_description": "POS",
         "tool_pricing": "Not publicly available",
         "tool_home_page": "Not publicly available",
+        "tool_logo_url": "Not publicly available",
         "category": "highest_roi",
         "solution_tags": ["other"],
+        "solution_types": [{
+            "id": "other",
+            "label": "Restaurant ops",
+            "description": "General operations software",
+        }],
     }]
+
+
+def test_logo_url_from_homepage(monkeypatch):
+    from backend.tool_rec import llmConnection
+
+    _fake_openrouter(monkeypatch, {"recommendations": [{
+        "problem": "x",
+        "final_recommendation": "Toast",
+        "tools": [{
+            "tool_number": 1,
+            "tool_name": "Toast",
+            "tool_tagline": "t",
+            "tool_description": "d",
+            "tool_pricing": "free",
+            "tool_home_page": "https://pos.toasttab.com/pricing",
+            "category": "platform_integrated",
+            "solution_tags": ["pos", "payments"],
+        }],
+    }]})
+    out = llmConnection.get_tools(["x"])
+    tool = out["recommendations"][0]["tools"][0]
+    assert tool["tool_logo_url"] == "https://logo.clearbit.com/pos.toasttab.com"
+    assert tool["solution_types"][0]["label"] == "POS"
+    assert tool["solution_types"][1]["label"] == "Payments"
 
 
 def test_get_tools_rejects_empty_result(monkeypatch):

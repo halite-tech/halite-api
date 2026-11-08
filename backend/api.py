@@ -29,7 +29,7 @@ from backend.shared.debug import debug, debug_trim
 from backend.tool_rec.llmConnection import get_tools
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3001"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # In-memory store; fine for a prototype, swap for a database in production.
 DATASETS: dict[str, Dataset] = {}
@@ -218,7 +218,8 @@ def delete_chat_session(session_id: str):
 async def chat_message(session_id: str, body: ChatMessageIn):
     """Send an owner message; replies as a server-sent-event stream.
 
-    Events: state (problem/clarity/action), tools (research kicked off once context is ready), token*, done | error.
+    Events: state, tools (running then ready/error), notice (interim "Looking for tools…"),
+    token* (assistant follow-up after tools finish when research ran this turn), done | error.
     """
     session = _chat_session_or_404(session_id)
     try:
