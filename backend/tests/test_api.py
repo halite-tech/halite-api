@@ -48,6 +48,12 @@ def test_upload_analyze_report_flow(client, restaurant):
     assert report.json()["alpha"] == 0.3
     assert client.get(f"/datasets/{dataset_id}").json()["analyzed"] is True
 
+    replacement = [("cash_drawer.csv", next(payload for name, payload in restaurant.raw_files() if name == "cash_drawer.csv"), "text/csv")]
+    replaced = client.post(f"/uploads", files=[("files", replacement[0])], data={"dataset_id": dataset_id})
+    assert replaced.status_code == 200
+    filenames = [file["filename"] for file in client.get(f"/datasets/{dataset_id}").json()["files"]]
+    assert filenames.count("cash_drawer.csv") == 1
+
 
 def test_unrecognized_upload_is_rejected(client):
     r = client.post("/uploads", files=[("files", ("x.csv", b"a,b\n1,2\n", "text/csv"))])

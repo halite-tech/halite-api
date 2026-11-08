@@ -2,9 +2,9 @@
 
 This doc is for anyone building the UI. The **primary path is not `/demo`**: judges should see **their own CSVs uploaded**, a **dataset built on the server**, engines run **once**, rankings from **that** restaurant, and **tool recommendations fired only when appropriate** (slow LLM — never block upload/analyze).
 
-**Swagger:** `http://<API_HOST>:8080/docs` while uvicorn is running.
+**Swagger:** `http://<API_HOST>:8000/docs` while uvicorn is running.
 
-**Base URL:** default `http://127.0.0.1:8080` (or your deployed host). **CORS** allows `http://localhost:3001` only — point the dev frontend at that origin or proxy API calls.
+**Base URL:** default `http://127.0.0.1:8000` (or your deployed host).
 
 **Env (server):** `OPENROUTER_API_KEY` in `AISB/.env` (required for chat and tools). Optional: `CHAT_STREAM_MODEL` (grill chat, default `openai/gpt-4o-mini`), `TOOL_REC_MODEL` (tool research, default `openai/gpt-4o-mini`).
 
@@ -16,7 +16,7 @@ Understand **when work happens** so the UI does not call endpoints too early or 
 
 | Stage | HTTP call | Server work | Typical duration | Cached? |
 |-------|-----------|-------------|------------------|---------|
-| **1. Ingest** | `POST /uploads` | Read files → map columns → **`build_dataset`** → store `Dataset` in memory | ~1–10 s (file count/size) | `dataset_id` until server restart |
+| **1. Ingest** | `POST /uploads` | Read files → map columns → **`build_dataset`** → store uploaded files durably | ~1–10 s (file count/size) | `dataset_id` survives server restart |
 | **2. Analyze** | `POST /analyze/{dataset_id}` | Run cost + time **engines once** → store `Analysis` | ~2–15 s | Until server restart |
 | **3. Re-rank** | `GET /report/{dataset_id}?alpha=` | **`build_report` only** (blend $ vs time) — **no** re-ingest, **no** re-run detectors | &lt; 1 s | Same `Analysis` |
 | **4. Tooling** | `GET /tools?dataset_id=&alpha=` | OpenRouter LLM from **that** report’s `top_problems` — **30–90+ s** (longer with 3 problems) | Long | Not cached |
@@ -53,12 +53,12 @@ Use this flow on stage so judges see **upload → ingest feedback → analyze �
 
 ### Before the demo
 
-1. **Backend running** (do not restart mid-demo — in-memory IDs are wiped):
+1. **Backend running** (uploaded files persist across restarts; analysis results are rebuilt on demand):
 
    ```bash
    cd AISB
    source .venv/bin/activate
-   uvicorn backend.api:app --host 0.0.0.0 --port 8080
+   uvicorn backend.api:app --host 0.0.0.0 --port 8000
    ```
 
 2. **`OPENROUTER_API_KEY`** in `AISB/.env` if you will show tooling (stage 4). Restart uvicorn after changing `.env`.
@@ -103,7 +103,7 @@ Point judges at fields that come from **their** upload:
 
 ## Stage 1 — `POST /uploads` (build dataset **here**)
 
-**This is the only step that runs ingest / `build_dataset`.** Analyze does not re-read raw files from disk; it uses the in-memory `Dataset` stored under `dataset_id`.
+**This is the only step that runs ingest / `build_dataset`.** The uploaded files and profile are stored in SQLite. On restart, the backend reloads them into the in-memory `Dataset`; analyze does not re-read the original browser upload.
 
 **Request:** `multipart/form-data`
 
@@ -130,7 +130,7 @@ const ingestRes = await fetch(`${API}/uploads`, { method: "POST", body: form });
 const ingest = await ingestRes.json();
 if (!ingestRes.ok) throw ingest;
 const { dataset_id, domains, files, data_quality } = ingest;
-// Persist dataset_id (sessionStorage) until server restart
+// Persist dataset_id in the URL or client storage so the UI can reopen the dataset
 ```
 
 **Success (200):**
@@ -513,9 +513,10 @@ Tooling does **not** accept a custom problem list from the client — it always 
 |--------|------|----------------|
 | `GET` | `/health` | Boot check → `{ "ok": true }` |
 | `GET` | `/taxonomy` | Category list for labels / `tool_tags` glossary |
-| `GET` | `/datasets` | List ingested datasets (`analyzed` true/false). Empty after server restart |
+| `GET` | `/datasets` | List durably stored datasets (`analyzed` true/false) |
 | `GET` | `/datasets/{dataset_id}` | One ingest summary (or `demo`); **404** if unknown / wiped |
-| `POST` | `/uploads` | User submits files (**build dataset**) |
+| `POST` | `/uploads` | User submits files (**build dataset**); include `dataset_id` to add files to an existing dataset |
+| `DELETE` | `/datasets/{dataset_id}/files?filename=...` | Remove one uploaded file and invalidate its analysis |
 | `POST` | `/analyze/{dataset_id}?alpha=` | Once per upload; returns full report |
 | `GET` | `/report/{dataset_id}?alpha=` | Alpha slider / refresh (requires prior analyze) |
 | `GET` | `/demo?alpha=` | **Dev / fallback** — synthetic report (no upload) |
@@ -542,7 +543,7 @@ Tooling does **not** accept a custom problem list from the client — it always 
 Substitute paths and host as needed.
 
 ```bash
-API=http://127.0.0.1:8080
+API=http://127.0.0.1:8000
 DIR=backend/synthetic/data
 
 # 1) Ingest

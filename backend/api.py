@@ -4,6 +4,7 @@ Run:  uvicorn backend.api:app --reload
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from functools import lru_cache
@@ -26,6 +27,7 @@ from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
 from backend.shared.debug import debug, debug_trim
+from backend.storage import create_dataset, delete_file, load_datasets, load_files, replace_files
 from backend.tool_rec.llmConnection import get_tools
 
 def _patch_uvicorn_keep_alive(seconds: int = 300) -> None:
@@ -68,11 +70,19 @@ def _sse_chunk(evt: dict) -> str:
 
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # In-memory store; fine for a prototype, swap for a database in production.
 DATASETS: dict[str, Dataset] = {}
 ANALYSES: dict[str, Analysis] = {}
+
+for _dataset_id, _profile, _files in load_datasets():
+    DATASETS[_dataset_id] = build_dataset(_files, Profile.from_dict(_profile))
 
 Alpha = Query(DEFAULT_ALPHA, ge=0.0, le=1.0, description="1.0 = rank by money only, 0.0 = by time only")
 
@@ -109,10 +119,11 @@ def _dataset_summary(dataset_id: str, ds: Dataset) -> dict:
 
 @app.get("/datasets")
 def list_datasets():
-    """In-memory ingest store: every upload that became a Dataset, plus whether analyze has run.
+    """List every durably stored upload, plus whether analyze has run.
 
-    Lost on server restart (same as dataset_id). `demo` is listed only after `/demo` (or
-    tools/chat with dataset_id=demo) has built the synthetic analysis.
+    Uploaded files and profiles are restored from SQLite when the server starts. Analysis
+    results remain in memory and are rebuilt on demand after a restart. `demo` is listed
+    only after `/demo` (or tools/chat with dataset_id=demo) has built the synthetic analysis.
     """
     items = [_dataset_summary(i, ds) for i, ds in DATASETS.items()]
     if _demo_analysis.cache_info().currsize:
@@ -131,24 +142,57 @@ def get_dataset(dataset_id: str):
 
 
 @app.post("/uploads")
-async def upload(files: list[UploadFile] = File(...), profile: str | None = Form(None)):
+async def upload(
+    files: list[UploadFile] = File(...),
+    profile: str | None = Form(None),
+    dataset_id: str | None = Form(None),
+):
     try:
         prof = Profile.from_dict(json.loads(profile) if profile else None)
     except (json.JSONDecodeError, TypeError) as exc:
         raise HTTPException(400, f"profile must be a JSON object: {exc}")
     raw = [(f.filename or "upload.csv", await f.read()) for f in files]
-    ds = build_dataset(raw, prof)
-    if not ds.tables:
+    incoming = build_dataset(raw, prof)
+    if not incoming.tables:
         raise HTTPException(422, {"error": "none of the files matched a known data type",
-                                  "files": [r.to_dict() for r in ds.files]})
-    dataset_id = uuid.uuid4().hex[:12]
-    DATASETS[dataset_id] = ds
+                                  "files": [r.to_dict() for r in incoming.files]})
+
+    if dataset_id:
+        ds = DATASETS.get(dataset_id)
+        if ds is None:
+            raise HTTPException(404, "unknown dataset_id")
+        replace_files(dataset_id, raw)
+        DATASETS[dataset_id] = build_dataset(load_files(dataset_id), ds.profile)
+        ANALYSES.pop(dataset_id, None)
+    else:
+        dataset_id = uuid.uuid4().hex[:12]
+        create_dataset(dataset_id, (prof or incoming.profile).to_dict(), raw)
+        DATASETS[dataset_id] = build_dataset(raw, prof)
+    ds = DATASETS[dataset_id]
     return {
         "dataset_id": dataset_id,
         "domains": sorted(ds.tables),
         "files": [r.to_dict() for r in ds.files],
         "data_quality": {d: q.to_dict() for d, q in ds.quality.items()},
     }
+
+
+@app.delete("/datasets/{dataset_id}/files")
+def delete_dataset_file(dataset_id: str, filename: str = Query(..., min_length=1)):
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        raise HTTPException(404, "unknown dataset_id")
+
+    report_index = next((i for i, report in enumerate(ds.files) if report.filename == filename), None)
+    if report_index is None:
+        raise HTTPException(404, "unknown file")
+
+    if not delete_file(dataset_id, filename):
+        raise HTTPException(404, "unknown file")
+    profile = ds.profile
+    DATASETS[dataset_id] = build_dataset(load_files(dataset_id), profile)
+    ANALYSES.pop(dataset_id, None)
+    return _dataset_summary(dataset_id, ds)
 
 
 @app.post("/analyze/{dataset_id}")
@@ -223,6 +267,50 @@ def tools(
     alpha: float = Alpha,
 ):
     return _tool_recommendations(dataset_id, alpha, log_label="GET /tools")
+
+
+@app.get("/tools/stream")
+async def stream_tools(
+    dataset_id: str = Query(..., description="Analyzed upload id, or 'demo' for synthetic data"),
+    alpha: float = Alpha,
+):
+    """Stream progress while researching tools for an analyzed dataset."""
+    report = build_report(_analysis_for_dataset(dataset_id), alpha)
+    problems = _problem_briefs_for_tools(report)
+    if not problems:
+        raise HTTPException(422, "no confident top problems to research; POST /analyze after upload")
+
+    async def events():
+        def chunk(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        updates = (
+            ("preparing", "Reading your top business problems…", 10),
+            ("researching", "Searching vendor sites and product capabilities…", 35),
+            ("pricing", "Checking pricing, integrations, and restaurant fit…", 60),
+            ("ranking", "Comparing the strongest options…", 82),
+        )
+        for phase, message, progress in updates[:1]:
+            yield chunk("progress", {"phase": phase, "message": message, "progress": progress})
+        task = asyncio.create_task(asyncio.to_thread(get_tools, problems))
+        index = 1
+        while not task.done():
+            await asyncio.sleep(2)
+            if task.done():
+                break
+            phase, message, progress = updates[index % len(updates)]
+            index += 1
+            yield chunk("progress", {"phase": phase, "message": message, "progress": progress})
+        try:
+            result = await task
+        except Exception as exc:
+            debug("api/tools", f"stream failed: {exc}")
+            yield chunk("error", {"message": f"Error getting tools: {exc}"})
+            return
+        yield chunk("progress", {"phase": "complete", "message": "Recommendations ready.", "progress": 100})
+        yield chunk("done", result)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
 
 
 @app.get("/demo/tools")
