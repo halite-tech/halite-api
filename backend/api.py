@@ -14,7 +14,12 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
+from backend.chat_stream import session as chat_sessions
+from backend.chat_stream.openrouter import OpenRouterError, api_key
+from backend.chat_stream.service import run_turn
 from backend.ingest.dataset import Dataset, Profile
 from backend.ingest.loader import build_dataset
 from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
@@ -101,3 +106,75 @@ def tools():
     except Exception as e:
         raise HTTPException(500, f"Error getting tools: {e}")
     return tool_recs
+
+# --------------------------------------------------------------------------- grill-me chat
+class ChatSessionIn(BaseModel):
+    dataset_id: str | None = Field(None, description="analysed dataset (or 'demo') to ground the grilling in")
+
+
+class ChatMessageIn(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+
+
+def _chat_context(dataset_id: str | None) -> str | None:
+    if not dataset_id:
+        return None
+    if dataset_id == "demo":
+        analysis = _demo_analysis()
+    elif dataset_id in ANALYSES:
+        analysis = ANALYSES[dataset_id]
+    else:
+        raise HTTPException(404, "unknown or un-analyzed dataset_id")
+    rep = build_report(analysis)
+    lines = [f"Restaurant: {rep['restaurant']['name']}"]
+    lines += [f"- {p['summary']}" for p in rep["top_problems"]]
+    return "\n".join(lines)
+
+
+def _chat_session_or_404(session_id: str) -> chat_sessions.ChatSession:
+    session = chat_sessions.get_session(session_id)
+    if session is None:
+        raise HTTPException(404, "unknown session_id")
+    return session
+
+
+@app.post("/chat/sessions")
+def create_chat_session(body: ChatSessionIn | None = None):
+    session = chat_sessions.create_session(_chat_context(body.dataset_id if body else None))
+    return session.to_dict()
+
+
+@app.get("/chat/sessions/{session_id}")
+def get_chat_session(session_id: str):
+    """Full transcript, current problem/clarity, and the latest tool recommendations (poll this)."""
+    return _chat_session_or_404(session_id).to_dict()
+
+
+@app.delete("/chat/sessions/{session_id}")
+def delete_chat_session(session_id: str):
+    if not chat_sessions.delete_session(session_id):
+        raise HTTPException(404, "unknown session_id")
+    return {"ok": True}
+
+
+@app.post("/chat/sessions/{session_id}/messages")
+async def chat_message(session_id: str, body: ChatMessageIn):
+    """Send an owner message; replies as a server-sent-event stream.
+
+    Events: state (problem/clarity/action), tools (research kicked off), token*, done | error.
+    """
+    session = _chat_session_or_404(session_id)
+    try:
+        api_key()
+    except OpenRouterError as exc:
+        raise HTTPException(500, str(exc))
+    if session.lock.locked():
+        raise HTTPException(409, "previous message is still being answered")
+
+    async def sse():
+        async with session.lock:
+            async for evt in run_turn(session, body.message.strip()):
+                yield f"event: {evt['event']}\ndata: {json.dumps(evt['data'])}\n\n"
+
+    return StreamingResponse(sse(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
