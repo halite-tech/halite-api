@@ -241,5 +241,9 @@ async def chat_message(session_id: str, body: ChatMessageIn):
             async for evt in run_turn(session, body.message.strip()):
                 yield f"event: {evt['event']}\ndata: {json.dumps(evt['data'])}\n\n"
 
+    # `Connection: close` — never reuse a connection that carried an SSE stream. Reused keep-alive
+    # connections that uvicorn already closed (idle timeout) or that a proxy/tunnel still holds make
+    # the *next* POST hang without ever reaching the app (the chat then looks frozen after `done`).
     return StreamingResponse(sse(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+                                      "Connection": "close"})

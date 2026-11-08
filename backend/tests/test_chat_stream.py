@@ -166,6 +166,16 @@ def test_spurious_new_problem_does_not_reset_context_or_turn_count(fake_llm):
             assert fact in brief
 
 
+def test_sse_response_closes_connection(fake_llm):
+    script, _, _ = fake_llm
+    with TestClient(app) as client:
+        sid = client.post("/chat/sessions").json()["session_id"]
+        script.append(analysis("new_problem", "Traffic is down"))
+        r = client.post(f"/chat/sessions/{sid}/messages", json={"message": "traffic is down"})
+        assert r.headers["content-type"].startswith("text/event-stream")
+        assert r.headers["connection"] == "close"
+
+
 def test_chat_errors(fake_llm, monkeypatch):
     with TestClient(app) as client:
         assert client.post("/chat/sessions/nope/messages", json={"message": "hi"}).status_code == 404
