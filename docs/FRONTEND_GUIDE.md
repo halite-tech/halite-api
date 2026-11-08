@@ -6,7 +6,7 @@ This doc is for anyone building the UI. The **primary path is not `/demo`**: jud
 
 ---
 
-## What the backend does in four stages
+## What the backend does in five stages
 
 Understand **when work happens** so the UI does not call endpoints too early or twice.
 
@@ -16,6 +16,7 @@ Understand **when work happens** so the UI does not call endpoints too early or 
 | **2. Analyze** | `POST /analyze/{dataset_id}` | Run cost + time **engines once** → store `Analysis` | ~2–15 s | Until server restart |
 | **3. Re-rank** | `GET /report/{dataset_id}?alpha=` | **`build_report` only** (blend $ vs time) — **no** re-ingest, **no** re-run detectors | &lt; 1 s | Same `Analysis` |
 | **4. Tooling** | `GET /tools` (today) | OpenRouter LLM from `top_problems` — **30–90+ s** | Long | Not cached |
+| **5. Grill chat** | `POST /chat/sessions` + `POST /chat/sessions/{id}/messages` (SSE) | OpenRouter chat that interrogates the owner about **one** problem; swaps the problem when the owner changes topic and re-runs the tools pipeline in the background | Reply streams in ~1–3 s; tools **30–90+ s** in background | In memory per `session_id` until server restart |
 
 **Rules for frontend**
 
@@ -236,7 +237,7 @@ Until then, frontend choices:
 const controller = new AbortController();
 const timeout = setTimeout(() => controller.abort(), 120_000);
 
-const llmMarkdown = await fetch(`${API}/tools`, {
+const raw = await fetch(`${API}/tools`, {
   signal: controller.signal,
 }).then(async (r) => {
   clearTimeout(timeout);
@@ -246,11 +247,113 @@ const llmMarkdown = await fetch(`${API}/tools`, {
   }
   return r.json() as Promise<string>; // body is a JSON-encoded string
 });
+const tool = JSON.parse(raw) as ToolRec; // the string itself contains JSON text
 ```
 
-**Response:** `application/json` body is usually a **string** containing **Markdown** (tool lists per problem), not a typed JSON array. See [Parsing LLM output](#parsing-llm-output-for-the-ui) below.
+**Response:** `application/json` body is a **string** that itself contains **JSON text** matching the strict schema in `llmConnection.py`: `{ tool_number, tool_name, tool_description, tool_pricing, tool_home_page }`. Parse twice (`r.json()` then `JSON.parse`). Today the schema describes a **single tool object**, not an array per problem. See [Parsing LLM output](#parsing-llm-output-for-the-ui) below.
 
 **500** — show `detail`, keep report on screen, offer retry.
+
+---
+
+## Stage 5 — Grill-me chat (`/chat/sessions`)
+
+A chat where an AI interrogator drills the owner on **one problem at a time** until it is clearly understood. It does **not** need upload/analyze, but you can pass a `dataset_id` (or `"demo"`) so the questions are grounded in that restaurant's top problems.
+
+How it behaves:
+
+- Only **one problem is in focus**. When the owner switches topic, the backend **drops the old problem and its working context**, adopts the new one, and **re-runs the tools pipeline** (`get_tools`) for it **in the background**. Tools run again once the problem becomes "understood".
+- The transcript is never wiped: a switch is recorded as a message with `role: "event"` and `type: "problem_changed"` so the UI can draw a divider.
+- A problem only becomes `understood: true` after **≥ 3 owner answers** on it and `clarity ≥ 85`.
+- Sessions live in server memory (lost on restart, like `dataset_id`).
+
+### 1. Create a session
+
+```ts
+const session = await fetch(`${API}/chat/sessions`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ dataset_id }), // body optional; dataset_id may be "demo"
+}).then((r) => r.json() as Promise<ChatSession>);
+// session.messages[0] is the grilling opener — render it
+```
+
+Errors: **404** unknown / un-analyzed `dataset_id`.
+
+### 2. Send a message (SSE stream)
+
+`POST /chat/sessions/{id}/messages` with `{ "message": "…" }` (1–4000 chars). The response is `text/event-stream`. `EventSource` only supports GET, so read the stream with `fetch`:
+
+```ts
+async function sendMessage(sessionId: string, message: string, on: (e: ChatEvent) => void) {
+  const res = await fetch(`${API}/chat/sessions/${sessionId}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) throw new Error((await res.json()).detail); // 404 / 409 / 422 / 500 arrive before streaming
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let i;
+    while ((i = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      const event = /^event: (.*)$/m.exec(block)![1];
+      const data = JSON.parse(/^data: (.*)$/m.exec(block)![1]);
+      on({ event, data } as ChatEvent);
+    }
+  }
+}
+```
+
+Events, in order:
+
+| Event | When | Payload |
+|-------|------|---------|
+| `state` | Right after the message is analysed (before any text) | `problem`, `problem_version`, `understood`, `clarity` (0–100), `known_facts[]`, `open_questions[]`, `action` (`keep` \| `refine` \| `new_problem`), `previous_problem` |
+| `tools` | Only when tool research was just (re)started | `status: "running"`, `problem` (the exact brief sent to the tools pipeline) |
+| `token` | Many times | `delta` — append to the assistant bubble |
+| `done` | End of stream | `state`, `tools` (status only, no result) |
+| `error` | Analysis or stream failed | `message` — `done` may still follow |
+
+Use `state` to update a "Current problem" header and a clarity meter immediately; when `action === "new_problem"`, show a "Switched problem" divider and clear the tools panel (it is now stale).
+
+### 3. Poll for tool recommendations
+
+Tools run **30–90+ s after** the stream ends, so poll `GET /chat/sessions/{id}` every 2–3 s while `tools.status === "running"`:
+
+```ts
+type ToolsState = {
+  status: "idle" | "running" | "ready" | "error";
+  problem: string | null; // brief these results were produced for
+  result: ToolRec | string | null; // parsed JSON from get_tools, or raw text if it wasn't JSON
+  error: string | null;
+  updated_at: number;
+};
+```
+
+Only show `result` when `tools.problem` matches the current problem; a run for a replaced problem is discarded by the server.
+
+### Other chat calls and errors
+
+| Call | Notes |
+|------|-------|
+| `GET /chat/sessions/{id}` | Full session: `messages[]`, problem state, `tools` (with `result`) |
+| `DELETE /chat/sessions/{id}` | End the session |
+
+| Code | When |
+|------|------|
+| 404 | Unknown `session_id` (or `dataset_id` on create) |
+| 409 | Previous message is still streaming — disable the input until `done` |
+| 422 | Empty or too-long `message` |
+| 500 | `OPENROUTER_API_KEY` missing |
+
+The chat model defaults to `openai/gpt-4o-mini`; set `CHAT_STREAM_MODEL` in `.env` to override.
 
 ---
 
@@ -271,9 +374,46 @@ type Session = {
   alpha: number;
   ingest: UploadResponse | null;
   report: Report | null;
-  toolsMarkdown: string | null;
+  tools: ToolRec | null;
   toolsError: string | null;
+  chat: ChatSession | null; // Stage 5 (independent of the phases above)
 };
+
+type ToolRec = {
+  tool_number: number;
+  tool_name: string;
+  tool_description: string;
+  tool_pricing: string;
+  tool_home_page: string;
+};
+
+type ChatMessage = {
+  role: "user" | "assistant" | "event";
+  content: string;
+  ts: number;
+  type?: "problem_changed"; // role "event" only
+  problem?: string;
+  previous_problem?: string | null;
+};
+
+type ChatSession = {
+  session_id: string;
+  problem: string | null;
+  problem_version: number;
+  understood: boolean;
+  clarity: number;
+  known_facts: string[];
+  open_questions: string[];
+  messages: ChatMessage[];
+  tools: ToolsState;
+};
+
+type ChatEvent =
+  | { event: "state"; data: Omit<ChatSession, "session_id" | "messages" | "tools"> & { action: string; previous_problem: string | null } }
+  | { event: "tools"; data: Omit<ToolsState, "result"> }
+  | { event: "token"; data: { delta: string } }
+  | { event: "done"; data: { state: unknown; tools: Omit<ToolsState, "result"> } }
+  | { event: "error"; data: { message: string } };
 ```
 
 Persist `datasetId` in `sessionStorage` with a banner: “Server restarted? Upload again.”
@@ -315,14 +455,12 @@ Pass **`top_problems`** (or a trimmed payload: `label`, `summary`, `category`, `
 
 ## Parsing LLM output for the UI
 
-1. `await response.json()` → **string** (Markdown).
-2. Split by problem: `### 1.`, `### 2.`, or `---`.
-3. Within each section, parse numbered tools and lines like `**Homepage:** [Name](url)`, `**Pricing:** …`.
-4. Align section `i` with `report.top_problems[i].label` when possible.
-5. Render with a Markdown component; keep regex parsing as a fallback for cards.
-6. Disclaimer: AI-generated — verify pricing and integrations on vendor sites.
+`get_tools` forces a strict JSON schema, so the output is **JSON, not Markdown**.
 
-If the backend later returns JSON objects (`tool_name`, `tool_pricing`, `tool_home_page`, …), parse arrays directly and reuse the same card components.
+1. `GET /tools`: `await response.json()` → **string** → `JSON.parse` it → `{ tool_number, tool_name, tool_description, tool_pricing, tool_home_page }`.
+2. Chat: `tools.result` is already parsed by the backend (an object with the same fields). If it is a **string**, parsing failed — show it as plain text.
+3. The schema is currently **one tool object**, not an array per problem. Render it as a single card and don't assume 4 tools per problem; if the backend later returns arrays, reuse the same card component.
+4. Disclaimer: AI-generated — verify pricing and integrations on vendor sites.
 
 ---
 
@@ -337,15 +475,19 @@ If the backend later returns JSON objects (`tool_name`, `tool_pricing`, `tool_ho
 | `GET` | `/report/{dataset_id}` | Alpha slider / refresh view |
 | `GET` | `/demo` | **Dev / fallback only** — skip ingest |
 | `GET` | `/tools` | **After** report; long wait; **demo problems today** |
+| `POST` | `/chat/sessions` | Open the grill-me chat (optional `dataset_id`) |
+| `POST` | `/chat/sessions/{session_id}/messages` | Each owner message; **SSE** reply |
+| `GET` | `/chat/sessions/{session_id}` | Restore transcript / poll tool recommendations |
+| `DELETE` | `/chat/sessions/{session_id}` | End the chat |
 
 ### Error cheat sheet
 
 | Code | When |
 |------|------|
-| 404 | Unknown `dataset_id` |
-| 409 | `GET /report` before analyze |
-| 422 | Bad upload or `alpha` |
-| 500 | Tooling / LLM failure |
+| 404 | Unknown `dataset_id` or `session_id` |
+| 409 | `GET /report` before analyze; or a chat message sent while the previous one is still streaming |
+| 422 | Bad upload, `alpha`, or empty/too-long chat `message` |
+| 500 | Tooling / LLM failure; missing `OPENROUTER_API_KEY` |
 
 ---
 
@@ -373,6 +515,14 @@ curl -s "$API/report/$ID?alpha=1.0" | python3 -c "import json,sys; r=json.load(s
 
 # 4) Tools (slow; optional)
 curl -s "$API/tools" | head -c 200
+
+# 5) Grill chat (-N disables buffering so tokens print live)
+SID=$(curl -s -X POST "$API/chat/sessions" | python3 -c "import json,sys; print(json.load(sys.stdin)['session_id'])")
+curl -N -X POST "$API/chat/sessions/$SID/messages" \
+  -H "Content-Type: application/json" \
+  -d '{"message":"my servers keep calling out last minute"}'
+# poll tools (ready after 30-90s)
+curl -s "$API/chat/sessions/$SID" | python3 -c "import json,sys; s=json.load(sys.stdin); print(s['problem'], s['tools']['status'])"
 ```
 
 ---
@@ -385,5 +535,6 @@ curl -s "$API/tools" | head -c 200
 | Report shape | `backend/ranker.py` |
 | Ingest / mapping | `backend/ingest/loader.py` |
 | LLM prompt / response | `backend/tool_rec/llmConnection.py` |
+| Grill chat (prompts, problem switching, SSE) | `backend/chat_stream/` (routes in `api.py`) |
 
 **Frontend is correct when:** upload builds the dataset once, analyze runs once, slider uses GET report, tooling is optional and slow and runs last — and tools consume the **same** `top_problems` the user already sees on the dashboard.
