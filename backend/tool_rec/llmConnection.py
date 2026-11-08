@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 import requests
+
+from backend.shared.debug import debug, debug_trim
 
 RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
 CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -91,6 +94,7 @@ For **EACH problem**, find exactly **4 AI tools**:
 For every tool, research: homepage URL, pricing, how it solves the problem, integrations, ROI, reliability, and adoptability.
 Use credible sources only; write "{NOT_AVAILABLE}" when you cannot verify a field.
 The tools must be real, currently available products that are directly relevant to the problem.
+ENSURE THE LINKS ARE VALID AND WORKING.
 
 **Problems to research:**
 {_problem_list(problems)}
@@ -197,11 +201,18 @@ def _research(problems: list[str]) -> str:
         "input": prompt_research(problems),
         "tools": [{"type": "openrouter:web_fetch", "parameters": {"max_uses": 4}}],
     }
+    t0 = time.time()
+    debug("tools", f"research start model={_model()} problems={len(problems)} web_fetch=on")
     try:
-        return _extract_output_text(_post(RESPONSES_URL, body, timeout=180))
-    except RuntimeError:
+        notes = _extract_output_text(_post(RESPONSES_URL, body, timeout=180))
+        debug("tools", f"research done in {time.time() - t0:.1f}s notes_chars={len(notes)}")
+        return notes
+    except RuntimeError as exc:
+        debug("tools", f"research web_fetch failed ({exc}); retrying without web_fetch")
         body.pop("tools")  # web tool unavailable/failed: still answer from the model's own knowledge
-        return _extract_output_text(_post(RESPONSES_URL, body, timeout=120))
+        notes = _extract_output_text(_post(RESPONSES_URL, body, timeout=120))
+        debug("tools", f"research done in {time.time() - t0:.1f}s (no web) notes_chars={len(notes)}")
+        return notes
 
 
 def _structure(problems: list[str], notes: str) -> dict[str, Any]:
@@ -215,12 +226,17 @@ def _structure(problems: list[str], notes: str) -> dict[str, Any]:
             "json_schema": {"name": "tool_rec", "strict": True, "schema": TOOL_REC_SCHEMA},
         },
     }
+    t0 = time.time()
+    debug("tools", "structure start (strict json_schema)")
     data = _post(CHAT_URL, body, timeout=120)
     try:
         text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError("unexpected OpenRouter response: no message content") from exc
-    return _json_from_model_text(text)
+    parsed = _json_from_model_text(text)
+    n_tools = sum(len(r.get("tools") or []) for r in parsed.get("recommendations") or [] if isinstance(r, dict))
+    debug("tools", f"structure done in {time.time() - t0:.1f}s raw_tool_rows={n_tools}")
+    return parsed
 
 
 def _text(value: Any, default: str = "") -> str:
@@ -265,11 +281,24 @@ def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[
 
 def get_tools(problems: list[str]) -> dict[str, Any]:
     """Return ``{"recommendations": [{problem, final_recommendation, tools: [...]}, ...]}``."""
+    t0 = time.time()
+    debug("tools", f"get_tools start n_problems={len(problems)}")
+    for i, p in enumerate(problems):
+        debug_trim("tools", f"  problem[{i}]: {p}", 160)
     notes = _research(problems)
     last_error: Exception | None = None
-    for _ in range(2):  # structuring is cheap; retry once on a malformed/empty answer
+    for attempt in range(2):  # structuring is cheap; retry once on a malformed/empty answer
         try:
-            return normalize_recommendations(_structure(problems, notes), problems)
+            out = normalize_recommendations(_structure(problems, notes), problems)
+            for rec in out["recommendations"]:
+                debug(
+                    "tools",
+                    f"  normalised: {len(rec['tools'])} tools | "
+                    f"{', '.join(t['tool_name'] for t in rec['tools'])}",
+                )
+            debug("tools", f"get_tools ok in {time.time() - t0:.1f}s")
+            return out
         except (ValueError, json.JSONDecodeError) as exc:
             last_error = exc
+            debug("tools", f"normalize/structure attempt {attempt + 1} failed: {exc}")
     raise RuntimeError(f"invalid tool JSON from model: {last_error}")

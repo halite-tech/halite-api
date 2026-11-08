@@ -58,6 +58,42 @@ def test_tools_requires_dataset_id(client):
     assert client.get("/tools").status_code == 422
 
 
+def test_demo_tools_uses_demo_problems(client, monkeypatch):
+    captured: list[list[str]] = []
+
+    def fake_get_tools(problems):
+        captured.append(problems)
+        return {
+            "recommendations": [
+                {
+                    "problem": problems[0],
+                    "final_recommendation": "Demo pick",
+                    "tools": [
+                        {
+                            "tool_number": 1,
+                            "tool_name": "DemoTool",
+                            "tool_description": "x",
+                            "tool_pricing": "free",
+                            "tool_home_page": "https://example.com",
+                            "category": "highest_roi",
+                        }
+                    ],
+                }
+            ]
+        }
+
+    monkeypatch.setattr("backend.api.get_tools", fake_get_tools)
+    r = client.get("/demo/tools?alpha=0.7")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["recommendations"][0]["tools"][0]["tool_name"] == "DemoTool"
+    assert captured
+    demo_report = client.get("/demo?alpha=0.7").json()
+    top = demo_report["top_problems"][0]
+    expected = f"{top['label']}: {top['summary']}"
+    assert captured[0][0] == expected
+
+
 def _fake_openrouter(monkeypatch, structured: dict):
     """Route the research (Responses API) and structuring (chat completions) calls."""
     from backend.tool_rec import llmConnection

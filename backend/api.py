@@ -19,12 +19,13 @@ from pydantic import BaseModel, Field
 
 from backend.chat_stream import session as chat_sessions
 from backend.chat_stream.openrouter import OpenRouterError, api_key
-from backend.chat_stream.service import run_turn
+from backend.chat_stream.service import problem_brief, run_turn
 from backend.ingest.dataset import Dataset, Profile
 from backend.ingest.loader import build_dataset
 from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
+from backend.shared.debug import debug, debug_trim
 from backend.tool_rec.llmConnection import get_tools
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
@@ -118,19 +119,38 @@ def _problem_briefs_for_tools(report: dict) -> list[str]:
     return briefs
 
 
+def _tool_recommendations(dataset_id: str, alpha: float, *, log_label: str) -> dict:
+    """LLM tool recs from an analysed dataset (upload id or ``demo``)."""
+    report = build_report(_analysis_for_dataset(dataset_id), alpha)
+    problems = _problem_briefs_for_tools(report)
+    if not problems:
+        raise HTTPException(422, "no confident top problems to research; POST /analyze after upload")
+    debug("api/tools", f"{log_label} dataset_id={dataset_id!r} alpha={alpha} briefs={len(problems)}")
+    for i, brief in enumerate(problems):
+        debug_trim("api/tools", f"  brief[{i}]: {brief}", 160)
+    try:
+        return get_tools(problems)
+    except Exception as e:
+        debug("api/tools", f"failed: {e}")
+        raise HTTPException(500, f"Error getting tools: {e}") from e
+
+
 @app.get("/tools")
 def tools(
     dataset_id: str = Query(..., description="Analyzed upload id, or 'demo' for synthetic data"),
     alpha: float = Alpha,
 ):
-    report = build_report(_analysis_for_dataset(dataset_id), alpha)
-    problems = _problem_briefs_for_tools(report)
-    if not problems:
-        raise HTTPException(422, "no confident top problems to research; POST /analyze after upload")
-    try:
-        return get_tools(problems)
-    except Exception as e:
-        raise HTTPException(500, f"Error getting tools: {e}")
+    return _tool_recommendations(dataset_id, alpha, log_label="GET /tools")
+
+
+@app.get("/demo/tools")
+def demo_tools(alpha: float = Alpha):
+    """AI tool recommendations for the synthetic **demo** restaurant (same data as ``GET /demo``).
+
+    No upload or analyze step — long-running OpenRouter call (30–90+ s).
+    Response shape matches ``GET /tools``.
+    """
+    return _tool_recommendations("demo", alpha, log_label="GET /demo/tools")
 
 # --------------------------------------------------------------------------- grill-me chat
 class ChatSessionIn(BaseModel):
@@ -160,14 +180,31 @@ def _chat_session_or_404(session_id: str) -> chat_sessions.ChatSession:
 
 @app.post("/chat/sessions")
 def create_chat_session(body: ChatSessionIn | None = None):
-    session = chat_sessions.create_session(_chat_context(body.dataset_id if body else None))
+    dataset_id = body.dataset_id if body else None
+    session = chat_sessions.create_session(_chat_context(dataset_id))
+    debug(
+        "api/chat",
+        f"POST /chat/sessions -> session_id={session.id} dataset_id={dataset_id!r} "
+        f"context={'yes' if session.context else 'no'}",
+    )
     return session.to_dict()
 
 
 @app.get("/chat/sessions/{session_id}")
 def get_chat_session(session_id: str):
     """Full transcript, current problem/clarity, and the latest tool recommendations (poll this)."""
-    return _chat_session_or_404(session_id).to_dict()
+    session = _chat_session_or_404(session_id)
+    t = session.tools
+    if t.status in ("ready", "error"):
+        recs = (t.result or {}).get("recommendations", []) if isinstance(t.result, dict) else []
+        brief = problem_brief(session)
+        debug(
+            "api/chat",
+            f"GET /chat/sessions/{session_id} tools={t.status} "
+            f"brief_match={t.problem == brief} recs={len(recs)} "
+            f"err={repr(t.error) if t.error else None}",
+        )
+    return session.to_dict()
 
 
 @app.delete("/chat/sessions/{session_id}")
@@ -181,7 +218,7 @@ def delete_chat_session(session_id: str):
 async def chat_message(session_id: str, body: ChatMessageIn):
     """Send an owner message; replies as a server-sent-event stream.
 
-    Events: state (problem/clarity/action), tools (research kicked off), token*, done | error.
+    Events: state (problem/clarity/action), tools (research kicked off once context is ready), token*, done | error.
     """
     session = _chat_session_or_404(session_id)
     try:
@@ -190,6 +227,13 @@ async def chat_message(session_id: str, body: ChatMessageIn):
         raise HTTPException(500, str(exc))
     if session.lock.locked():
         raise HTTPException(409, "previous message is still being answered")
+
+    debug_trim(
+        "api/chat",
+        f"POST /chat/sessions/{session_id}/messages problem={session.problem!r} "
+        f"tools={session.tools.status} msg={body.message.strip()!r}",
+        200,
+    )
 
     async def sse():
         async with session.lock:

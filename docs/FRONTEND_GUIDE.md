@@ -275,7 +275,8 @@ A chat where an AI interrogator drills the owner on **one problem at a time** un
 
 How it behaves:
 
-- Only **one problem is in focus**. When the owner switches topic, the backend **drops the old problem and its working context**, adopts the new one, and **re-runs the tools pipeline** (`get_tools` on a single brief built from that problem + `known_facts`) **in the background**. Tools run again when the problem becomes **newly** `understood` (or when the problem text changes while understood).
+- Only **one problem is in focus**. When the owner switches topic, the backend **drops the old problem and its working context**, adopts the new one, and clears prior tool results (`tools.status` → `idle`) until enough context is collected again.
+- **Tool research** (`get_tools` on `problem` + `known_facts`) starts only after **either** the extractor marks the problem **`understood: true`** **or** the owner has sent **4 messages** on the current problem (whichever comes first). Earlier turns are grill-only (no SSE `tools` event).
 - The transcript is never wiped: a switch is recorded as a message with `role: "event"` and `type: "problem_changed"` so the UI can draw a divider.
 - A problem only becomes `understood: true` after **≥ 3 owner answers** on it and `clarity ≥ 85`.
 - Sessions live in server memory (lost on restart, like `dataset_id`).
@@ -374,7 +375,7 @@ Only show `result` when `tools.problem` matches the current problem; a run for a
 
 Mid-stream failures arrive as SSE `event: error` with `{ message }` (HTTP stays 200). Chat model: `CHAT_STREAM_MODEL` (see env vars at the top).
 
-**When tool research starts** (you get SSE `tools` + background work): the owner **switches** to a new problem, or the current problem becomes **`understood`** (including when the problem text changes while already understood). The first owner message always counts as a new problem focus, so research usually starts immediately.
+**When tool research starts** (SSE `tools`, then poll `GET /chat/sessions/{id}`): on the message where **`understood` flips to true** (needs **≥ 3** owner answers and **clarity ≥ 85**) **or** on the **4th** owner message on the current problem if still not understood. Switching problems resets the count and tool state; the grill runs again before the next tooling call. If the brief changes after tools already **ready** for an older brief, research runs again once the threshold is still met.
 
 ---
 
@@ -500,8 +501,9 @@ Tooling does **not** accept a custom problem list from the client — it always 
 | `POST` | `/uploads` | User submits files (**build dataset**) |
 | `POST` | `/analyze/{dataset_id}?alpha=` | Once per upload; returns full report |
 | `GET` | `/report/{dataset_id}?alpha=` | Alpha slider / refresh (requires prior analyze) |
-| `GET` | `/demo?alpha=` | **Dev / fallback** — synthetic report; pair with `dataset_id=demo` for tools/chat |
-| `GET` | `/tools?dataset_id=&alpha=` | **After** analyze (or `dataset_id=demo`); long wait; LLM from that report’s `top_problems` |
+| `GET` | `/demo?alpha=` | **Dev / fallback** — synthetic report (no upload) |
+| `GET` | `/demo/tools?alpha=` | **Dev / smoke** — tool recs for the demo restaurant only (same as `GET /tools?dataset_id=demo`) |
+| `GET` | `/tools?dataset_id=&alpha=` | **After** analyze, or `dataset_id=demo`; long wait; LLM from that report’s `top_problems` |
 | `POST` | `/chat/sessions` | Open the grill-me chat (optional `dataset_id`) |
 | `POST` | `/chat/sessions/{session_id}/messages` | Each owner message; **SSE** reply |
 | `GET` | `/chat/sessions/{session_id}` | Restore transcript / poll tool recommendations |

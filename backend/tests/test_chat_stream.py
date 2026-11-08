@@ -69,18 +69,21 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
 
         script.append(analysis("new_problem", "Food waste is high", facts=["waste bin full nightly"]))
         events = send(client, sid, "we throw out so much food")
-        assert [e for e, _ in events] == ["state", "tools", "token", "token", "done"]
+        assert [e for e, _ in events] == ["state", "token", "token", "done"]  # grill first; no tools yet
         assert events[0][1]["problem"] == "Food waste is high"
-        assert "".join(d["delta"] for e, d in events if e == "token") == "Why exactly?"
-        wait_for_tools(client, sid)
-        assert "Food waste is high" in tool_calls[-1][0]
-        assert "waste bin full nightly" in tool_calls[-1][0]
+        assert len(tool_calls) == 0
 
-        script.append(analysis("keep", "ignored", clarity=40))
-        events = send(client, sid, "about 200 lbs a week")
-        assert [e for e, _ in events] == ["state", "token", "token", "done"]  # no tools re-run
-        assert events[0][1]["problem"] == "Food waste is high"
+        script.append(analysis("keep", "Food waste is high", clarity=40, facts=["waste bin full nightly"]))
+        send(client, sid, "about 200 lbs a week")
+        script.append(analysis("keep", "Food waste is high", clarity=50, facts=["waste bin full nightly", "200 lbs/wk"]))
+        send(client, sid, "mostly produce")
+        script.append(analysis("keep", "Food waste is high", clarity=60, facts=["waste bin full nightly", "200 lbs/wk"]))
+        events = send(client, sid, "we use Toast POS")
+        assert "tools" in [e for e, _ in events]  # 4th owner message -> tooling
+        wait_for_tools(client, sid)
         assert len(tool_calls) == 1
+        assert "Food waste is high" in tool_calls[-1][0]
+        assert "200 lbs/wk" in tool_calls[-1][0]
 
         script.append(analysis("new_problem", "Servers no-show constantly", facts=["3 no-shows a month"]))
         events = send(client, sid, "actually forget that, my real problem is no-shows")
@@ -89,13 +92,19 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         assert state["previous_problem"] == "Food waste is high"
         assert state["problem"] == "Servers no-show constantly"
         assert state["known_facts"] == ["3 no-shows a month"]
-        assert events[1][0] == "tools"
+        assert "tools" not in [e for e, _ in events]  # new problem: grill before tools
 
         # the model only sees the new problem's context: old problem and its turns are gone
         sent = seen_prompts[-1]
         assert "Food waste" not in json.dumps(sent)
         assert [m["role"] for m in sent] == ["system", "user"]
 
+        for _ in range(2):
+            script.append(analysis("keep", "Servers no-show constantly", facts=["3 no-shows a month"]))
+            send(client, sid, "more detail")
+        script.append(analysis("keep", "Servers no-show constantly", facts=["3 no-shows a month", "Fridays worst"]))
+        events = send(client, sid, "Fridays are the worst")
+        assert "tools" in [e for e, _ in events]
         tools = wait_for_tools(client, sid)
         assert "Servers no-show" in tools["result"]["for"]
         assert len(tool_calls) == 2
@@ -114,16 +123,16 @@ def test_understood_needs_minimum_rounds_then_refreshes_tools(fake_llm):
         events = send(client, sid, "tickets take 40 min")
         assert events[0][1]["understood"] is False  # model said done after one answer; guardrail refuses
         assert events[0][1]["clarity"] == 84
-        wait_for_tools(client, sid)
+        assert "tools" not in [e for e, _ in events]
 
-        script.append(analysis("keep", "", clarity=95, understood=True))
+        script.append(analysis("keep", "Slow ticket times", clarity=95, understood=True))
         assert send(client, sid, "answer 2")[0][1]["understood"] is False
-        script.append(analysis("keep", "", clarity=95, understood=True))
+        script.append(analysis("keep", "Slow ticket times", clarity=95, understood=True))
         events = send(client, sid, "answer 3")
         assert events[0][1]["understood"] is True
-        assert [e for e, _ in events][1] == "tools"  # final refresh once understood
+        assert [e for e, _ in events][1] == "tools"  # understood after 3 rounds (before 4-message cap)
         wait_for_tools(client, sid)
-        assert len(tool_calls) == 2
+        assert len(tool_calls) == 1
 
 
 def test_chat_errors(fake_llm, monkeypatch):
