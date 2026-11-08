@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -27,7 +28,7 @@ from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
 from backend.shared.debug import debug, debug_trim
-from backend.storage import create_dataset, delete_file, load_datasets, load_files, replace_files
+from backend.storage import create_dataset, delete_file, delete_files, load_datasets, load_files, replace_files
 from backend.tool_rec.llmConnection import get_tools
 
 def _patch_uvicorn_keep_alive(seconds: int = 300) -> None:
@@ -195,6 +196,24 @@ def delete_dataset_file(dataset_id: str, filename: str = Query(..., min_length=1
     return _dataset_summary(dataset_id, ds)
 
 
+@app.delete("/datasets/{dataset_id}/files/bulk")
+def delete_dataset_files(dataset_id: str, filenames: list[str]):
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        raise HTTPException(404, "unknown dataset_id")
+    requested = list(dict.fromkeys(filename for filename in filenames if filename.strip()))
+    if not requested:
+        raise HTTPException(400, "filenames must contain at least one filename")
+    known = {report.filename for report in ds.files}
+    unknown = [filename for filename in requested if filename not in known]
+    if unknown:
+        raise HTTPException(404, f"unknown file: {unknown[0]}")
+    delete_files(dataset_id, requested)
+    DATASETS[dataset_id] = build_dataset(load_files(dataset_id), ds.profile)
+    ANALYSES.pop(dataset_id, None)
+    return _dataset_summary(dataset_id, DATASETS[dataset_id])
+
+
 @app.post("/analyze/{dataset_id}")
 def run_analysis(dataset_id: str, alpha: float = Alpha):
     ds = DATASETS.get(dataset_id)
@@ -236,10 +255,23 @@ def _analysis_for_dataset(dataset_id: str) -> Analysis:
     raise HTTPException(404, "unknown dataset_id")
 
 
-def _problem_briefs_for_tools(report: dict) -> list[str]:
+def _problem_briefs_for_tools(report: dict, selected_problem: str | None = None) -> list[str]:
     briefs: list[str] = []
-    for p in report.get("top_problems") or []:
+    def normalized(value: object) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
+    selected = normalized(selected_problem)
+    candidates = report.get("top_problems") or []
+    if not selected:
+        candidates = candidates[:2]
+    for p in candidates:
         label = (p.get("label") or p.get("category") or "Problem").strip()
+        if selected:
+            candidates = {normalized(label), normalized(p.get("category"))}
+            if selected not in candidates and not any(
+                selected in candidate or candidate in selected for candidate in candidates if candidate
+            ):
+                continue
         summary = (p.get("summary") or "").strip()
         briefs.append(f"{label}: {summary}" if summary else label)
     return briefs
@@ -273,10 +305,11 @@ def tools(
 async def stream_tools(
     dataset_id: str = Query(..., description="Analyzed upload id, or 'demo' for synthetic data"),
     alpha: float = Alpha,
+    problem: str | None = Query(None, description="Optional problem label/category to research"),
 ):
     """Stream progress while researching tools for an analyzed dataset."""
     report = build_report(_analysis_for_dataset(dataset_id), alpha)
-    problems = _problem_briefs_for_tools(report)
+    problems = _problem_briefs_for_tools(report, problem)
     if not problems:
         raise HTTPException(422, "no confident top problems to research; POST /analyze after upload")
 
@@ -334,6 +367,10 @@ class ChatMessageIn(BaseModel):
 def _chat_context(dataset_id: str | None) -> str | None:
     if not dataset_id:
         return None
+    if dataset_id != "demo" and dataset_id not in ANALYSES and dataset_id in DATASETS:
+        # Uploaded files survive restarts; rebuild the in-memory analysis before chat
+        # session creation so the app and chat panel can reload in parallel safely.
+        ANALYSES[dataset_id] = analyze(DATASETS[dataset_id])
     analysis = _analysis_for_dataset(dataset_id)
     rep = build_report(analysis)
     lines = [f"Restaurant: {rep['restaurant']['name']}"]

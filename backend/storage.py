@@ -86,6 +86,16 @@ def delete_file(dataset_id: str, filename: str) -> bool:
         return True
 
 
+def delete_files(dataset_id: str, filenames: list[str]) -> int:
+    with _connect() as connection:
+        cursor = connection.executemany(
+            "DELETE FROM dataset_files WHERE dataset_id = ? AND filename = ?",
+            [(dataset_id, filename) for filename in dict.fromkeys(filenames)],
+        )
+        connection.commit()
+        return cursor.rowcount
+
+
 def load_datasets() -> list[tuple[str, dict, list[tuple[str, bytes]]]]:
     with _connect() as connection:
         datasets = connection.execute(

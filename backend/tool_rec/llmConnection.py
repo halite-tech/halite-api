@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
@@ -29,6 +31,8 @@ CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "openai/gpt-4o-mini"
 NOT_AVAILABLE = "Not publicly available"
 CATEGORIES = ("platform_integrated", "highest_roi")
+MAX_PROBLEMS = 2
+MAX_TOOLS_PER_PROBLEM = 3
 
 # What kind of product it is (for UI chips / filters) — not the platform_integrated vs ROI bucket.
 SOLUTION_TAGS = (
@@ -141,8 +145,8 @@ def prompt_research(problems: list[str]) -> str:
     return f"""
 You are an experienced restaurant owner with 10+ years of operational experience. Identify the best AI tools to solve each problem listed below.
 
-For **EACH problem**, find exactly **4 AI tools**:
-- 2 **platform_integrated** tools that fit an existing restaurant POS/ops stack.
+For **EACH problem**, find exactly **3 AI tools**:
+- 1 **platform_integrated** tool that fits an existing restaurant POS/ops stack.
 - 2 **highest_roi** tools with strong cost/revenue impact.
 
 For every tool, research: homepage URL, pricing, how it solves the problem, integrations, ROI, reliability, and adoptability.
@@ -171,8 +175,8 @@ Convert the research notes below into JSON that matches the response schema exac
 Rules:
 - `recommendations` has exactly one entry per problem, in the same order as the problems list.
 - `problem` repeats the problem text. `final_recommendation` is the owner's pick and why.
-- `tools` has exactly 4 entries per problem: 2 with category `platform_integrated`, 2 with `highest_roi`.
-  `tool_number` runs 1-4 within each problem.
+- `tools` has exactly 3 entries per problem: 1 with category `platform_integrated`, 2 with `highest_roi`.
+  `tool_number` runs 1-3 within each problem.
 - `tool_tagline` is one punchy sentence (under ~25 words) — quick UI intro; not redundant with the name.
 - `tool_description` is the full narrative (what it does, how it solves the problem, integrations,
   ROI, reliability, adoptability).
@@ -263,7 +267,7 @@ def _research(problems: list[str]) -> str:
     body: dict[str, Any] = {
         "model": _model(),
         "input": prompt_research(problems),
-        "tools": [{"type": "openrouter:web_fetch", "parameters": {"max_uses": 4}}],
+        "tools": [{"type": "openrouter:web_fetch", "parameters": {"max_uses": 3}}],
     }
     t0 = time.time()
     debug("tools", f"research start model={_model()} problems={len(problems)} web_fetch=on")
@@ -324,11 +328,8 @@ def _host_from_url(url: str) -> str | None:
 
 
 def _logo_url(home_page: str) -> str:
-    """Best-effort brand mark for the UI (Clearbit); frontend may fall back on 404."""
-    host = _host_from_url(home_page)
-    if not host:
-        return NOT_AVAILABLE
-    return f"https://logo.clearbit.com/{host}"
+    """Keep logo discovery in the frontend so broken provider URLs are not persisted."""
+    return NOT_AVAILABLE
 
 
 def _solution_types(tag_ids: list[str]) -> list[dict[str, str]]:
@@ -380,7 +381,7 @@ def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[
     for i, problem in enumerate(problems):
         rec = recs_in[i] if i < len(recs_in) and isinstance(recs_in[i], dict) else {}
         tools: list[dict[str, Any]] = []
-        for t in rec.get("tools") or []:
+        for t in (rec.get("tools") or [])[:MAX_TOOLS_PER_PROBLEM]:
             if not isinstance(t, dict) or not _text(t.get("tool_name")):
                 continue
             category = t.get("category")
@@ -412,17 +413,17 @@ def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[
     return {"recommendations": recs_out}
 
 
-def get_tools(problems: list[str]) -> dict[str, Any]:
+def _get_tools_uncached(problems: tuple[str, ...]) -> dict[str, Any]:
     """Return ``{"recommendations": [{problem, final_recommendation, tools: [...]}, ...]}``."""
     t0 = time.time()
-    debug("tools", f"get_tools start n_problems={len(problems)}")
+    debug("tools", f"get_tools start n_problems={len(problems)} cache=miss")
     for i, p in enumerate(problems):
         debug_trim("tools", f"  problem[{i}]: {p}", 160)
-    notes = _research(problems)
+    notes = _research(list(problems))
     last_error: Exception | None = None
     for attempt in range(2):  # structuring is cheap; retry once on a malformed/empty answer
         try:
-            out = normalize_recommendations(_structure(problems, notes), problems)
+            out = normalize_recommendations(_structure(list(problems), notes), list(problems))
             for rec in out["recommendations"]:
                 debug(
                     "tools",
@@ -435,3 +436,24 @@ def get_tools(problems: list[str]) -> dict[str, Any]:
             last_error = exc
             debug("tools", f"normalize/structure attempt {attempt + 1} failed: {exc}")
     raise RuntimeError(f"invalid tool JSON from model: {last_error}")
+
+
+@lru_cache(maxsize=128)
+def _cached_tools(model: str, transport_id: int, problems: tuple[str, ...]) -> dict[str, Any]:
+    # Cache only successful, fully normalized results; callers receive copies so UI code
+    # cannot mutate the shared cache entry.
+    return _get_tools_uncached(problems)
+
+
+def get_tools(problems: list[str]) -> dict[str, Any]:
+    """Return up to two problem groups with three normalized tools per group."""
+    selected = tuple(p.strip() for p in problems[:MAX_PROBLEMS] if p and p.strip())
+    if not selected:
+        raise ValueError("at least one problem is required")
+    model = _model()
+    transport_id = id(requests.post)
+    before = _cached_tools.cache_info().hits
+    result = deepcopy(_cached_tools(model, transport_id, selected))
+    if _cached_tools.cache_info().hits > before:
+        debug("tools", f"cache hit n_problems={len(selected)}")
+    return result

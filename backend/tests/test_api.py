@@ -66,6 +66,32 @@ def test_unknown_dataset_is_404(client):
     assert client.get("/datasets/nope").status_code == 404
 
 
+def test_chat_session_rebuilds_analysis_after_restart(client, restaurant):
+    files = [("files", (name, payload, "text/csv")) for name, payload in restaurant.raw_files()]
+    up = client.post("/uploads", files=files, data={"profile": json.dumps({"name": "Chat Reload"})})
+    assert up.status_code == 200
+    dataset_id = up.json()["dataset_id"]
+    from backend.api import ANALYSES
+    ANALYSES.pop(dataset_id, None)
+
+    session = client.post("/chat/sessions", json={"dataset_id": dataset_id})
+    assert session.status_code == 200
+    assert dataset_id in ANALYSES
+
+
+def test_bulk_delete_files(client):
+    files = [
+        ("files", ("sales.csv", b"Order #,Order Time,Net Sales\n1,2026-01-01,10\n", "text/csv")),
+        ("files", ("cash_drawer.csv", b"Date,Expected Cash,Counted Cash\n2026-01-01,10,10\n", "text/csv")),
+    ]
+    up = client.post("/uploads", files=files)
+    assert up.status_code == 200
+    dataset_id = up.json()["dataset_id"]
+    deleted = client.request("DELETE", f"/datasets/{dataset_id}/files/bulk", json=["sales.csv", "cash_drawer.csv"])
+    assert deleted.status_code == 200
+    assert deleted.json()["files"] == []
+
+
 def test_taxonomy_lists_categories_with_tool_tags(client):
     cats = client.get("/taxonomy").json()
     assert len(cats) == 9
@@ -74,6 +100,20 @@ def test_taxonomy_lists_categories_with_tool_tags(client):
 
 def test_tools_requires_dataset_id(client):
     assert client.get("/tools").status_code == 422
+
+
+def test_selected_tool_problem_can_use_visible_third_problem():
+    from backend.api import _problem_briefs_for_tools
+
+    report = {
+        "top_problems": [
+            {"label": "Labor Scheduling", "category": "labor_scheduling", "summary": "labor"},
+            {"label": "Hiring and Retention", "category": "hiring_retention", "summary": "hiring"},
+            {"label": "Inventory and Waste", "category": "inventory_waste", "summary": "inventory"},
+        ]
+    }
+    assert _problem_briefs_for_tools(report) == ["Labor Scheduling: labor", "Hiring and Retention: hiring"]
+    assert _problem_briefs_for_tools(report, "Inventory and Waste") == ["Inventory and Waste: inventory"]
 
 
 def test_demo_tools_uses_demo_problems(client, monkeypatch):
@@ -201,7 +241,7 @@ def test_get_tools_normalizes_incomplete_model_output(monkeypatch):
     }]
 
 
-def test_logo_url_from_homepage(monkeypatch):
+def test_logo_url_from_homepage_is_not_synthesized(monkeypatch):
     from backend.tool_rec import llmConnection
 
     _fake_openrouter(monkeypatch, {"recommendations": [{
@@ -220,7 +260,7 @@ def test_logo_url_from_homepage(monkeypatch):
     }]})
     out = llmConnection.get_tools(["x"])
     tool = out["recommendations"][0]["tools"][0]
-    assert tool["tool_logo_url"] == "https://logo.clearbit.com/pos.toasttab.com"
+    assert tool["tool_logo_url"] == "Not publicly available"
     assert tool["solution_types"][0]["label"] == "POS"
     assert tool["solution_types"][1]["label"] == "Payments"
 
@@ -272,6 +312,6 @@ def test_tools_uses_analyzed_upload_not_demo(client, restaurant, monkeypatch):
     assert body["recommendations"][0]["tools"][0]["tool_name"] == "Test"
     assert captured
     briefs = captured[0]
-    assert len(briefs) == 3
+    assert len(briefs) == 2
     assert all(isinstance(b, str) for b in briefs)
     assert client.get(f"/report/{dataset_id}").json()["top_problems"][0]["summary"] in briefs[0]
