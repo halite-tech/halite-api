@@ -27,6 +27,14 @@ MIN_ROUNDS = 3  # owner answers required on a problem before it can count as und
 MAX_OWNER_TURNS_BEFORE_TOOLS = 3  # else launch tools with whatever context was collected
 UNDERSTOOD_CLARITY = 85
 LOOKING_FOR_TOOLS_MSG = "Looking for tools…"
+STATUS_THINKING = ("thinking", "Thinking about your answer…")
+STATUS_COMPOSING = ("composing", "Writing a follow-up…")
+RESEARCH_TICKS = (
+    ("researching", "Looking for tools that match this problem…"),
+    ("researching", "Checking vendor sites and pricing…"),
+    ("aggregating", "Aggregating the strongest options…"),
+    ("aggregating", "Scoring what would work in your restaurant…"),
+)
 MAX_CONTEXT_MESSAGES = 30  # messages of the current problem sent to the model
 EXTRACTOR_WINDOW = 12
 
@@ -210,10 +218,16 @@ def _event(name: str, data: dict) -> dict:
     return {"event": name, "data": data}
 
 
+def _status(phase: str, message: str) -> dict:
+    """Ephemeral UI ticker — not stored in the transcript. Clear it on `token` or `done`."""
+    return _event("status", {"phase": phase, "message": message})
+
+
 async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dict]:
-    """Yield {"event", "data"} dicts: state, tools, token*, done (or error)."""
+    """Yield {"event", "data"} dicts: status, state, tools, notice, token*, done (or error)."""
     was_understood = session.understood
     debug_trim("chat", f"session={session.id} turn IN: {user_message!r}", 120)
+    yield _status(*STATUS_THINKING)
     try:
         analysis = await _analyze(session, user_message)
     except Exception as exc:  # noqa: BLE001
@@ -258,11 +272,20 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
         yield _event("tools", _tools_status(session))
         session.log("assistant", LOOKING_FOR_TOOLS_MSG, problem_version=session.problem_version)
         yield _event("notice", {"text": LOOKING_FOR_TOOLS_MSG})
-        try:
-            await tools_task
-        except Exception as exc:  # noqa: BLE001
-            debug("chat", f"session={session.id} tools task failed: {exc}")
+        yield _status(*RESEARCH_TICKS[0])
+        tick = 1
+        while not tools_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(tools_task), timeout=8)
+            except asyncio.TimeoutError:
+                phase, message = RESEARCH_TICKS[tick % len(RESEARCH_TICKS)]
+                tick += 1
+                yield _status(phase, message)
+            except Exception as exc:  # noqa: BLE001
+                debug("chat", f"session={session.id} tools task failed: {exc}")
+                break
         yield _event("tools", _tools_status(session))
+        yield _status("aggregating", "Recommendations ready — writing a follow-up…")
     else:
         debug(
             "chat",
@@ -271,6 +294,8 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
             f"understood={session.understood} tools={session.tools.status}",
         )
 
+    if not launch_tools_now:
+        yield _status(*STATUS_COMPOSING)
     try:
         async for delta in stream_chat(messages):
             parts.append(delta)

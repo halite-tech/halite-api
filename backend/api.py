@@ -11,10 +11,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import StreamingResponse
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.chat_stream import session as chat_sessions
@@ -27,6 +27,45 @@ from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
 from backend.shared.debug import debug, debug_trim
 from backend.tool_rec.llmConnection import get_tools
+
+def _patch_uvicorn_keep_alive(seconds: int = 300) -> None:
+    """Tunnels reuse sockets to this process. Uvicorn's default 5s idle timeout closes them
+    while the owner is typing; the next POST is written to a dead socket and never arrives.
+    Patch the protocol so keep-alive outlasts a typical pause between chat messages.
+    """
+    def _wrap(cls) -> None:
+        orig = cls.__init__
+
+        def init(self, *args, **kwargs):
+            orig(self, *args, **kwargs)
+            self.timeout_keep_alive = seconds
+
+        cls.__init__ = init  # type: ignore[method-assign]
+
+    try:
+        from uvicorn.protocols.http.httptools_impl import HttpToolsProtocol
+        _wrap(HttpToolsProtocol)
+    except Exception:
+        pass
+    try:
+        from uvicorn.protocols.http.h11_impl import H11Protocol
+        _wrap(H11Protocol)
+    except Exception:
+        pass
+
+
+_patch_uvicorn_keep_alive()
+
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _sse_chunk(evt: dict) -> str:
+    """Format one SSE event. Pad `status` so proxies flush (thinking indicator must arrive immediately)."""
+    block = f"event: {evt['event']}\ndata: {json.dumps(evt['data'])}\n\n"
+    if evt.get("event") == "status":
+        block += ": " + (" " * 2048) + "\n\n"
+    return block
+
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -46,6 +85,49 @@ def health():
 @app.get("/taxonomy")
 def taxonomy():
     return [c.to_dict() for c in CATEGORIES.values()]
+
+
+def _iso(ts) -> str | None:
+    return None if ts is None else ts.isoformat()
+
+
+def _dataset_summary(dataset_id: str, ds: Dataset) -> dict:
+    """What the frontend needs to restore ingest UI without re-uploading."""
+    return {
+        "dataset_id": dataset_id,
+        "name": ds.profile.name,
+        "analyzed": dataset_id in ANALYSES or dataset_id == "demo",
+        "domains": sorted(ds.tables),
+        "files": [r.to_dict() for r in ds.files],
+        "data_quality": {d: q.to_dict() for d, q in ds.quality.items()},
+        "profile": ds.profile.to_dict(),
+        "period_start": _iso(ds.period_start),
+        "period_end": _iso(ds.period_end),
+        "row_counts": {d: int(len(df)) for d, df in ds.tables.items()},
+    }
+
+
+@app.get("/datasets")
+def list_datasets():
+    """In-memory ingest store: every upload that became a Dataset, plus whether analyze has run.
+
+    Lost on server restart (same as dataset_id). `demo` is listed only after `/demo` (or
+    tools/chat with dataset_id=demo) has built the synthetic analysis.
+    """
+    items = [_dataset_summary(i, ds) for i, ds in DATASETS.items()]
+    if _demo_analysis.cache_info().currsize:
+        items.append(_dataset_summary("demo", _demo_analysis().dataset))
+    return {"datasets": items}
+
+
+@app.get("/datasets/{dataset_id}")
+def get_dataset(dataset_id: str):
+    if dataset_id == "demo":
+        return _dataset_summary("demo", _demo_analysis().dataset)
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        raise HTTPException(404, "unknown dataset_id")
+    return _dataset_summary(dataset_id, ds)
 
 
 @app.post("/uploads")
@@ -218,8 +300,8 @@ def delete_chat_session(session_id: str):
 async def chat_message(session_id: str, body: ChatMessageIn):
     """Send an owner message; replies as a server-sent-event stream.
 
-    Events: state, tools (running then ready/error), notice (interim "Looking for tools…"),
-    token* (assistant follow-up after tools finish when research ran this turn), done | error.
+    Events: status (thinking / researching / aggregating), state, tools, notice,
+    token*, done | error. Always streamed so the UI can show a thinking ticker immediately.
     """
     session = _chat_session_or_404(session_id)
     try:
@@ -239,11 +321,6 @@ async def chat_message(session_id: str, body: ChatMessageIn):
     async def sse():
         async with session.lock:
             async for evt in run_turn(session, body.message.strip()):
-                yield f"event: {evt['event']}\ndata: {json.dumps(evt['data'])}\n\n"
+                yield _sse_chunk(evt)
 
-    # `Connection: close` — never reuse a connection that carried an SSE stream. Reused keep-alive
-    # connections that uvicorn already closed (idle timeout) or that a proxy/tunnel still holds make
-    # the *next* POST hang without ever reaching the app (the chat then looks frozen after `done`).
-    return StreamingResponse(sse(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no",
-                                      "Connection": "close"})
+    return StreamingResponse(sse(), media_type="text/event-stream", headers=SSE_HEADERS)

@@ -149,6 +149,7 @@ const { dataset_id, domains, files, data_quality } = ingest;
 - Show `domains.length` and a per-file mapping from `files` (matched vs unmapped columns).
 - If `domains` is small, warn that ranking may be thin (`not_assessed` on report).
 - Store `dataset_id`; enable “Run analysis” only now.
+- On app boot, `GET /datasets` (and `GET /datasets/{id}` if you have a stored id) to see what is still in server memory vs wiped by restart.
 
 **Errors**
 
@@ -335,11 +336,12 @@ Events, in order:
 
 | Event | When | Payload |
 |-------|------|---------|
-| `state` | Right after the message is analysed (before any text) | `problem`, `problem_version`, `understood`, `clarity` (0–100), `known_facts[]`, `open_questions[]`, `action` (`keep` \| `refine` \| `new_problem`), `previous_problem` |
-| `tools` | When research **starts** (`status: "running"`) and again when it **finishes** (`ready` or `error`) on the same SSE connection | `status`, `problem` (brief); no `result` — poll GET for JSON |
-| `notice` | Once, right after tools start on that turn | `{ "text": "Looking for tools…" }` — show as its own assistant line (also in `messages[]`) |
-| `token` | After `notice` + tools `ready`/`error` (if research ran); otherwise immediately after `state` | `delta` — second assistant bubble (wrap-up / follow-up question) |
-| `done` | End of stream | `state`, `tools` (status only, no result) |
+| `status` | Immediately on every turn, then while tools run | `{ phase, message }` — **show `message` as a thinking ticker** (three dots). `phase`: `thinking` \| `researching` \| `aggregating` \| `composing`. Not stored in `messages[]`. **Hide it on the first `token` or on `done`.** |
+| `state` | After the extractor (problem/clarity) | `problem`, `problem_version`, `understood`, `clarity` (0–100), `known_facts[]`, `open_questions[]`, `action` (`keep` \| `refine` \| `new_problem`), `previous_problem` |
+| `tools` | When research **starts** (`status: "running"`) and again when it **finishes** (`ready` or `error`) | `status`, `problem` (brief); no `result` — poll GET for JSON |
+| `notice` | Once, right after tools start on that turn | `{ "text": "Looking for tools…" }` — assistant line (also in `messages[]`) |
+| `token` | After analysis (grill-only) or after tools finish (research turn) | `delta` — append to the assistant bubble; clear the `status` ticker |
+| `done` | End of stream | `state`, `tools` (status only, no result); clear the ticker |
 | `error` | Analysis or stream failed | `message` — `done` may still follow |
 
 Use `state` to update a "Current problem" header and a clarity meter immediately; when `action === "new_problem"`, show a "Switched problem" divider and clear the tools panel (it is now stale).
@@ -448,6 +450,7 @@ type ChatSession = {
 };
 
 type ChatEvent =
+  | { event: "status"; data: { phase: "thinking" | "researching" | "aggregating" | "composing"; message: string } }
   | { event: "state"; data: Omit<ChatSession, "session_id" | "messages" | "tools"> & { action: string; previous_problem: string | null } }
   | { event: "tools"; data: Omit<ToolsState, "result"> }
   | { event: "notice"; data: { text: string } }
@@ -510,6 +513,8 @@ Tooling does **not** accept a custom problem list from the client — it always 
 |--------|------|----------------|
 | `GET` | `/health` | Boot check → `{ "ok": true }` |
 | `GET` | `/taxonomy` | Category list for labels / `tool_tags` glossary |
+| `GET` | `/datasets` | List ingested datasets (`analyzed` true/false). Empty after server restart |
+| `GET` | `/datasets/{dataset_id}` | One ingest summary (or `demo`); **404** if unknown / wiped |
 | `POST` | `/uploads` | User submits files (**build dataset**) |
 | `POST` | `/analyze/{dataset_id}?alpha=` | Once per upload; returns full report |
 | `GET` | `/report/{dataset_id}?alpha=` | Alpha slider / refresh (requires prior analyze) |

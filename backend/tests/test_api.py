@@ -30,12 +30,23 @@ def test_upload_analyze_report_flow(client, restaurant):
     dataset_id = up.json()["dataset_id"]
     assert len(up.json()["domains"]) == 17
 
+    listed = client.get("/datasets")
+    assert listed.status_code == 200
+    ids = [d["dataset_id"] for d in listed.json()["datasets"]]
+    assert dataset_id in ids
+    one = client.get(f"/datasets/{dataset_id}")
+    assert one.status_code == 200
+    assert one.json()["analyzed"] is False
+    assert one.json()["name"] == "Test"
+    assert "sales" in one.json()["domains"]
+
     assert client.get(f"/report/{dataset_id}").status_code == 409
     analyzed = client.post(f"/analyze/{dataset_id}")
     assert analyzed.status_code == 200
     report = client.get(f"/report/{dataset_id}?alpha=0.3")
     assert report.status_code == 200
     assert report.json()["alpha"] == 0.3
+    assert client.get(f"/datasets/{dataset_id}").json()["analyzed"] is True
 
 
 def test_unrecognized_upload_is_rejected(client):
@@ -46,6 +57,7 @@ def test_unrecognized_upload_is_rejected(client):
 def test_unknown_dataset_is_404(client):
     assert client.get("/report/nope").status_code == 404
     assert client.post("/analyze/nope").status_code == 404
+    assert client.get("/datasets/nope").status_code == 404
 
 
 def test_taxonomy_lists_categories_with_tool_tags(client):

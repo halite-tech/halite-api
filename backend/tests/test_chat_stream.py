@@ -11,9 +11,21 @@ from backend.chat_stream import service
 def parse_sse(text: str) -> list[tuple[str, dict]]:
     out = []
     for block in text.strip().split("\n\n"):
-        lines = dict(line.split(": ", 1) for line in block.split("\n"))
-        out.append((lines["event"], json.loads(lines["data"])))
+        fields = {}
+        for line in block.split("\n"):
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                fields[k] = v
+            elif line.startswith(":"):
+                continue
+        if "event" not in fields or "data" not in fields:
+            continue
+        out.append((fields["event"], json.loads(fields["data"])))
     return out
+
+
+def first_state(events):
+    return next(d for e, d in events if e == "state")
 
 
 @pytest.fixture
@@ -72,8 +84,11 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
 
         script.append(analysis("new_problem", "Food waste is high", facts=["waste bin full nightly"]))
         events = send(client, sid, "we throw out so much food")
-        assert [e for e, _ in events] == ["state", "token", "token", "done"]  # grill first; no tools yet
-        assert events[0][1]["problem"] == "Food waste is high"
+        names = [e for e, _ in events]
+        assert names[0] == "status" and events[0][1]["phase"] == "thinking"
+        assert "state" in names and names[-1] == "done"
+        assert "tools" not in names  # grill first; no tools yet
+        assert first_state(events)["problem"] == "Food waste is high"
         assert len(tool_calls) == 0
 
         script.append(analysis("keep", "Food waste is high", clarity=40, facts=["waste bin full nightly"]))
@@ -82,8 +97,8 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         events = send(client, sid, "mostly produce")
         names = [e for e, _ in events]
         assert "tools" in names and "notice" in names  # 3rd owner message -> tooling
-        assert events[0][1]["clarity"] == 100
-        assert events[0][1]["understood"] is True
+        assert first_state(events)["clarity"] == 100
+        assert first_state(events)["understood"] is True
         assert any(d.get("text") == service.LOOKING_FOR_TOOLS_MSG for e, d in events if e == "notice")
         assert names.index("notice") < names.index("token")
         wait_for_tools(client, sid)
@@ -93,7 +108,7 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
 
         script.append(analysis("new_problem", "Servers no-show constantly", facts=["3 no-shows a month"]))
         events = send(client, sid, "actually forget that, my real problem is no-shows")
-        state = events[0][1]
+        state = first_state(events)
         assert state["action"] == "new_problem"
         assert state["previous_problem"] == "Food waste is high"
         assert state["problem"] == "Servers no-show constantly"
@@ -126,18 +141,18 @@ def test_understood_needs_minimum_rounds_then_refreshes_tools(fake_llm):
         sid = client.post("/chat/sessions").json()["session_id"]
         script.append(analysis("new_problem", "Slow ticket times", clarity=95, understood=True))
         events = send(client, sid, "tickets take 40 min")
-        assert events[0][1]["understood"] is False  # model said done after one answer; guardrail refuses
-        assert events[0][1]["clarity"] == 84
+        assert first_state(events)["understood"] is False  # model said done after one answer; guardrail refuses
+        assert first_state(events)["clarity"] == 84
         assert "tools" not in [e for e, _ in events]
 
         script.append(analysis("keep", "Slow ticket times", clarity=95, understood=True))
-        assert send(client, sid, "answer 2")[0][1]["understood"] is False
+        assert first_state(send(client, sid, "answer 2"))["understood"] is False
         script.append(analysis("keep", "Slow ticket times", clarity=95, understood=True))
         events = send(client, sid, "answer 3")
-        assert events[0][1]["understood"] is True
-        assert events[0][1]["clarity"] == 100
+        assert first_state(events)["understood"] is True
+        assert first_state(events)["clarity"] == 100
         names = [e for e, _ in events]
-        assert names[1] == "tools" and "notice" in names  # understood after 3 rounds (same as message cap)
+        assert "tools" in names and "notice" in names  # understood after 3 rounds (same as message cap)
         assert names.index("notice") < next(i for i, e in enumerate(names) if e == "token")
         wait_for_tools(client, sid)
         assert len(tool_calls) == 1
@@ -155,8 +170,8 @@ def test_spurious_new_problem_does_not_reset_context_or_turn_count(fake_llm):
             script.append(analysis("new_problem", "Owner describes seats/POS", facts=[f"detail {i}"],
                                    explicit_switch=False))
             events = send(client, sid, msg)
-            assert events[0][1]["action"] == "refine"
-            assert events[0][1]["problem"] == "Traffic is down 50%"
+            assert first_state(events)["action"] == "refine"
+            assert first_state(events)["problem"] == "Traffic is down 50%"
         assert "tools" in [e for e, _ in events]  # 3rd owner message on the same problem
         wait_for_tools(client, sid)
         assert len(tool_calls) == 1
@@ -166,14 +181,16 @@ def test_spurious_new_problem_does_not_reset_context_or_turn_count(fake_llm):
             assert fact in brief
 
 
-def test_sse_response_closes_connection(fake_llm):
+def test_turn_starts_with_thinking_status(fake_llm):
     script, _, _ = fake_llm
     with TestClient(app) as client:
         sid = client.post("/chat/sessions").json()["session_id"]
         script.append(analysis("new_problem", "Traffic is down"))
         r = client.post(f"/chat/sessions/{sid}/messages", json={"message": "traffic is down"})
         assert r.headers["content-type"].startswith("text/event-stream")
-        assert r.headers["connection"] == "close"
+        events = parse_sse(r.text)
+        assert events[0] == ("status", {"phase": "thinking", "message": "Thinking about your answer…"})
+        assert events[-1][0] == "done"
 
 
 def test_chat_errors(fake_llm, monkeypatch):
