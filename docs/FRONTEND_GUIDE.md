@@ -404,10 +404,16 @@ type Session = {
 type Tool = {
   tool_number: number; // 1-4 within a problem
   tool_name: string;
-  tool_description: string;
+  tool_tagline: string; // one-line UI subtitle
+  tool_description: string; // full narrative
   tool_pricing: string;
   tool_home_page: string; // URL, or "Not publicly available"
   category: "platform_integrated" | "highest_roi";
+  solution_tags: (
+    | "pos" | "payments" | "scheduling" | "inventory" | "delivery" | "reservations"
+    | "marketing" | "loyalty" | "accounting" | "analytics" | "ai_llm" | "automation"
+    | "voice" | "labor" | "waste" | "guest_experience" | "communication" | "other"
+  )[]; // 1–3 chips, e.g. ["pos", "payments"]
 };
 
 type ToolRecs = {

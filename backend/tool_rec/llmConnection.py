@@ -29,23 +29,54 @@ DEFAULT_MODEL = "openai/gpt-4o-mini"
 NOT_AVAILABLE = "Not publicly available"
 CATEGORIES = ("platform_integrated", "highest_roi")
 
+# What kind of product it is (for UI chips / filters) — not the platform_integrated vs ROI bucket.
+SOLUTION_TAGS = (
+    "pos",
+    "payments",
+    "scheduling",
+    "inventory",
+    "delivery",
+    "reservations",
+    "marketing",
+    "loyalty",
+    "accounting",
+    "analytics",
+    "ai_llm",
+    "automation",
+    "voice",
+    "labor",
+    "waste",
+    "guest_experience",
+    "communication",
+    "other",
+)
+
 TOOL_ITEM_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "tool_number": {"type": "integer"},
         "tool_name": {"type": "string"},
+        "tool_tagline": {"type": "string"},
         "tool_description": {"type": "string"},
         "tool_pricing": {"type": "string"},
         "tool_home_page": {"type": "string"},
         "category": {"type": "string", "enum": list(CATEGORIES)},
+        "solution_tags": {
+            "type": "array",
+            "items": {"type": "string", "enum": list(SOLUTION_TAGS)},
+            "minItems": 1,
+            "maxItems": 3,
+        },
     },
     "required": [
         "tool_number",
         "tool_name",
+        "tool_tagline",
         "tool_description",
         "tool_pricing",
         "tool_home_page",
         "category",
+        "solution_tags",
     ],
     "additionalProperties": False,
 }
@@ -92,9 +123,13 @@ For **EACH problem**, find exactly **4 AI tools**:
 - 2 **highest_roi** tools with strong cost/revenue impact.
 
 For every tool, research: homepage URL, pricing, how it solves the problem, integrations, ROI, reliability, and adoptability.
+Also classify each tool with 1–3 **solution tags** (e.g. `pos`, `ai_llm`, `scheduling`, `marketing`) and a one-sentence **tagline** for a UI subtitle.
 Use credible sources only; write "{NOT_AVAILABLE}" when you cannot verify a field.
 The tools must be real, currently available products that are directly relevant to the problem.
 ENSURE THE LINKS ARE VALID AND WORKING.
+
+Allowed solution tags (pick the best fit, use `other` only if nothing else applies):
+{", ".join(SOLUTION_TAGS)}
 
 **Problems to research:**
 {_problem_list(problems)}
@@ -113,8 +148,11 @@ Rules:
 - `problem` repeats the problem text. `final_recommendation` is the owner's pick and why.
 - `tools` has exactly 4 entries per problem: 2 with category `platform_integrated`, 2 with `highest_roi`.
   `tool_number` runs 1-4 within each problem.
-- `tool_description` is the full narrative for the tool (what it does, how it solves the problem,
-  integrations, ROI, reliability, adoptability).
+- `tool_tagline` is one punchy sentence (under ~25 words) — quick UI intro; not redundant with the name.
+- `tool_description` is the full narrative (what it does, how it solves the problem, integrations,
+  ROI, reliability, adoptability).
+- `solution_tags` is 1–3 values from exactly: {", ".join(SOLUTION_TAGS)} — primary product type(s), e.g.
+  Toast → `pos` + `payments`; an AI menu writer → `ai_llm` + `marketing`.
 - `tool_pricing` is a short pricing summary; `tool_home_page` is a full URL.
 - Use "{NOT_AVAILABLE}" for any field the notes do not support. Never invent facts.
 
@@ -248,6 +286,35 @@ def _headline(problem: str) -> str:
     return next((ln.strip() for ln in problem.splitlines() if ln.strip()), problem.strip())
 
 
+def _normalize_tags(raw: Any) -> list[str]:
+    tags: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                key = item.strip().lower().replace("-", "_").replace(" ", "_")
+                if key in SOLUTION_TAGS and key not in tags:
+                    tags.append(key)
+    elif isinstance(raw, str):
+        key = raw.strip().lower().replace("-", "_").replace(" ", "_")
+        if key in SOLUTION_TAGS:
+            tags.append(key)
+    return tags[:3] if tags else ["other"]
+
+
+def _tagline(value: Any, description: str) -> str:
+    if line := _text(value):
+        return line[:240]
+    desc = _text(description)
+    if not desc:
+        return NOT_AVAILABLE
+    if len(desc) <= 160:
+        return desc
+    cut = desc[:160]
+    if " " in cut:
+        return cut.rsplit(" ", 1)[0] + "…"
+    return cut + "…"
+
+
 def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[str, Any]:
     """Guarantee the frontend shape: one entry per problem, every tool has every field."""
     recs_in = raw.get("recommendations")
@@ -261,13 +328,16 @@ def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[
             if not isinstance(t, dict) or not _text(t.get("tool_name")):
                 continue
             category = t.get("category")
+            description = _text(t.get("tool_description"), NOT_AVAILABLE)
             tools.append({
                 "tool_number": len(tools) + 1,
                 "tool_name": _text(t.get("tool_name")),
-                "tool_description": _text(t.get("tool_description"), NOT_AVAILABLE),
+                "tool_tagline": _tagline(t.get("tool_tagline"), description),
+                "tool_description": description,
                 "tool_pricing": _text(t.get("tool_pricing"), NOT_AVAILABLE),
                 "tool_home_page": _text(t.get("tool_home_page"), NOT_AVAILABLE),
                 "category": category if category in CATEGORIES else "highest_roi",
+                "solution_tags": _normalize_tags(t.get("solution_tags")),
             })
         recs_out.append({
             "problem": _text(rec.get("problem"), _headline(problem)),

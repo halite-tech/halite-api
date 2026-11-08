@@ -128,8 +128,16 @@ def test_get_tools_two_stage_returns_full_shape(monkeypatch):
     from backend.tool_rec import llmConnection
 
     def tool(n, name, cat):
-        return {"tool_number": n, "tool_name": name, "tool_description": "d", "tool_pricing": "free",
-                "tool_home_page": "https://example.com", "category": cat}
+        return {
+            "tool_number": n,
+            "tool_name": name,
+            "tool_tagline": "Quick intro.",
+            "tool_description": "d",
+            "tool_pricing": "free",
+            "tool_home_page": "https://example.com",
+            "category": cat,
+            "solution_tags": ["ai_llm"],
+        }
 
     calls = _fake_openrouter(monkeypatch, {"recommendations": [{
         "problem": "low traffic", "final_recommendation": "Use SEO",
@@ -158,9 +166,14 @@ def test_get_tools_normalizes_incomplete_model_output(monkeypatch):
     assert rec["problem"] == "Slow turnover"
     assert rec["final_recommendation"] == ""
     assert rec["tools"] == [{
-        "tool_number": 1, "tool_name": "Toast", "tool_description": "POS",
-        "tool_pricing": "Not publicly available", "tool_home_page": "Not publicly available",
+        "tool_number": 1,
+        "tool_name": "Toast",
+        "tool_tagline": "POS",
+        "tool_description": "POS",
+        "tool_pricing": "Not publicly available",
+        "tool_home_page": "Not publicly available",
         "category": "highest_roi",
+        "solution_tags": ["other"],
     }]
 
 
