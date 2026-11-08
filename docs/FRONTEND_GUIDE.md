@@ -4,6 +4,10 @@ This doc is for anyone building the UI. The **primary path is not `/demo`**: jud
 
 **Swagger:** `http://<API_HOST>:8080/docs` while uvicorn is running.
 
+**Base URL:** default `http://127.0.0.1:8080` (or your deployed host). **CORS** allows `http://localhost:3001` only — point the dev frontend at that origin or proxy API calls.
+
+**Env (server):** `OPENROUTER_API_KEY` in `AISB/.env` (required for chat and tools). Optional: `CHAT_STREAM_MODEL` (grill chat, default `openai/gpt-4o-mini`), `TOOL_REC_MODEL` (tool research, default `openai/gpt-4o-mini`).
+
 ---
 
 ## What the backend does in five stages
@@ -15,7 +19,7 @@ Understand **when work happens** so the UI does not call endpoints too early or 
 | **1. Ingest** | `POST /uploads` | Read files → map columns → **`build_dataset`** → store `Dataset` in memory | ~1–10 s (file count/size) | `dataset_id` until server restart |
 | **2. Analyze** | `POST /analyze/{dataset_id}` | Run cost + time **engines once** → store `Analysis` | ~2–15 s | Until server restart |
 | **3. Re-rank** | `GET /report/{dataset_id}?alpha=` | **`build_report` only** (blend $ vs time) — **no** re-ingest, **no** re-run detectors | &lt; 1 s | Same `Analysis` |
-| **4. Tooling** | `GET /tools` (today) | OpenRouter LLM from `top_problems` — **30–90+ s** | Long | Not cached |
+| **4. Tooling** | `GET /tools?dataset_id=&alpha=` | OpenRouter LLM from **that** report’s `top_problems` — **30–90+ s** (longer with 3 problems) | Long | Not cached |
 | **5. Grill chat** | `POST /chat/sessions` + `POST /chat/sessions/{id}/messages` (SSE) | OpenRouter chat that interrogates the owner about **one** problem; swaps the problem when the owner changes topic and re-runs the tools pipeline in the background | Reply streams in ~1–3 s; tools **30–90+ s** in background | In memory per `session_id` until server restart |
 
 **Rules for frontend**
@@ -37,7 +41,7 @@ stateDiagram-v2
   Analyzing --> Ingested: 404 lost id
   ReportReady --> ReportReady: GET /report?alpha (slider)
   ReportReady --> ToolingLoading: user opens tools OR prefetch
-  ToolingLoading --> ToolsReady: GET /tools 200
+  ToolingLoading --> ToolsReady: GET /tools?dataset_id 200
   ToolingLoading --> ReportReady: tools error (keep report)
 ```
 
@@ -82,7 +86,7 @@ Use this flow on stage so judges see **upload → ingest feedback → analyze �
 | 3 | “Run analysis” (spinner) | `POST /analyze/{dataset_id}?alpha=0.7` | “Engines estimate $ and time pain per category.” |
 | 4 | Results dashboard | Use analyze response **or** `GET /report` | “Top 3 problems for **this** restaurant.” |
 | 5 | Alpha slider | `GET /report/{dataset_id}?alpha=` only | “Owner can weigh money vs time.” |
-| 6 | Optional: “Find AI tools” | `GET /tools` (slow) | “Research runs **after** we know the problems.” |
+| 6 | Optional: “Find AI tools” | `GET /tools?dataset_id={id}&alpha=` (slow) | “Research runs **after** we know the problems — for **this** upload.” |
 
 **Do not** open the demo with `GET /demo` if the story is “we ingest your files.” Reserve `/demo` for dev smoke tests or a “skip upload” escape hatch.
 
@@ -122,9 +126,10 @@ form.append(
   JSON.stringify({ name: restaurantName, sqft: 3000 })
 );
 
-const ingest = await fetch(`${API}/uploads`, { method: "POST", body: form });
-if (!ingest.ok) throw await ingest.json();
-const { dataset_id, domains, files, data_quality } = await ingest.json();
+const ingestRes = await fetch(`${API}/uploads`, { method: "POST", body: form });
+const ingest = await ingestRes.json();
+if (!ingestRes.ok) throw ingest;
+const { dataset_id, domains, files, data_quality } = ingest;
 // Persist dataset_id (sessionStorage) until server restart
 ```
 
@@ -150,7 +155,7 @@ const { dataset_id, domains, files, data_quality } = await ingest.json();
 | Code | Meaning |
 |------|---------|
 | 400 | Invalid `profile` JSON |
-| 422 | No file matched a known schema — show `files` from body |
+| 422 | No file matched a known schema — FastAPI `detail` is an object: `{ "error": "...", "files": [...] }` |
 
 ---
 
@@ -181,6 +186,8 @@ const report = await fetch(
 
 ## Stage 3 — `GET /report/{dataset_id}?alpha=` (slider — **fast**)
 
+Same report object as `POST /analyze/{dataset_id}` and (without an upload) `GET /demo?alpha=`.
+
 When the user changes money vs time weighting:
 
 ```ts
@@ -199,60 +206,66 @@ const report = await fetch(
 
 ---
 
-## Stage 4 — Tooling (slow — **after** report is visible)
+## Stage 4 — `GET /tools?dataset_id=` (slow — **after** report is visible)
+
+### What the backend does
+
+After **analyze** (or when using synthetic data), call tools with the **same** `dataset_id` as the report (`"demo"` for `GET /demo` smoke tests). The server:
+
+1. Rebuilds the report at the requested `alpha` (same blending as `/report`).
+2. Builds one LLM brief per entry in `top_problems` (usually **3**): `"{label}: {summary}"`.
+3. Runs `get_tools` once for all of those briefs (web research + strict JSON structuring + normalisation).
+
+| `dataset_id` | Requirement |
+|--------------|-------------|
+| Upload id | `POST /analyze/{dataset_id}` must have succeeded |
+| `"demo"` | No upload — uses cached synthetic analysis |
+
+**Query params**
+
+| Param | Required | Notes |
+|-------|----------|--------|
+| `dataset_id` | yes | Upload id or `"demo"` |
+| `alpha` | no | Same as report slider (default `0.7`) — re-ranks problems before picking briefs |
 
 ### Timing and UX
 
 | Do | Don’t |
 |----|--------|
-| Start tooling **after** `top_problems` is on screen | Await `GET /tools` inside upload/analyze |
-| Dedicated panel: “Researching tools… 30–60s” | Block the whole app on one spinner |
+| Start tooling **after** `top_problems` is on screen | Await tools inside upload/analyze |
+| Dedicated panel: “Researching tools… 30–90s” (use **180s** timeout for 3 problems) | Block the whole app on one spinner |
 | `AbortController` + retry on failure | Assume tools finished because analyze did |
-| Let user read drivers/summary while tools load | Fire tools on every alpha change |
+| Let user read drivers/summary while tools load | Fire tools on every alpha tweak (only refetch if the user explicitly asks) |
 
-Optional **prefetch:** when analyze completes, fire `GET /tools` in the background if the user enabled “Include AI recommendations,” but still render the report immediately from analyze.
+Optional **prefetch:** when analyze completes, fire `GET /tools?dataset_id=…` in the background if the user enabled “Include AI recommendations,” but still render the report immediately from analyze.
 
-### Current API behavior (read this before judging)
-
-Today, **`GET /tools` ignores the user’s `dataset_id`**. It internally builds a **demo** report and passes **demo** `top_problems` into the LLM (`backend/api.py`).
-
-| User journey | Report from upload? | Tools match upload? |
-|--------------|---------------------|---------------------|
-| Upload → analyze → show report | Yes | **No** (until backend wires `dataset_id`) |
-| `GET /demo` only | Synthetic only | Yes (demo problems) |
-
-**For a coherent judge story**, backend should add something like:
-
-- `POST /tools/{dataset_id}` or `GET /tools?dataset_id=` **after** analyze exists, passing **that** report’s `top_problems` to `get_tools`.
-
-Until then, frontend choices:
-
-1. **Honest UX:** After real upload, show report from analyze; label tools as “sample research” or hide the tools button.
-2. **Backend fix (preferred):** Wire tools to the same `dataset_id` — frontend calls tools **only after** analyze, with the same id.
-
-**Call pattern today:**
+**Call pattern:**
 
 ```ts
-// Only after report is shown; separate loading state; long timeout (e.g. 120s)
+const params = new URLSearchParams({ dataset_id: datasetId, alpha: String(alpha) });
 const controller = new AbortController();
-const timeout = setTimeout(() => controller.abort(), 120_000);
+const timeout = setTimeout(() => controller.abort(), 180_000);
 
-const raw = await fetch(`${API}/tools`, {
-  signal: controller.signal,
-}).then(async (r) => {
-  clearTimeout(timeout);
-  if (!r.ok) {
-    const err = await r.json();
-    throw new Error(err.detail ?? "tools failed");
-  }
-  return r.json() as Promise<ToolRecs>; // plain JSON object, no second parse
-});
-const recs = raw.recommendations; // one entry per problem, each with up to 4 tools
+const toolsRes = await fetch(`${API}/tools?${params}`, { signal: controller.signal });
+clearTimeout(timeout);
+const body = await toolsRes.json();
+if (!toolsRes.ok) {
+  throw new Error(typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail));
+}
+const toolRecs = body as ToolRecs;
+// toolRecs.recommendations.length === report.top_problems.length (when the API had confident problems)
 ```
 
-**Response:** a plain JSON object (`ToolRecs`, see types below): `recommendations[]`, one per problem, each `{ problem, final_recommendation, tools: Tool[] }` with 4 tools (`platform_integrated` / `highest_roi`). The backend normalises the model output, so every field is always present (`"Not publicly available"` when unverified). See [Parsing LLM output](#parsing-llm-output-for-the-ui).
+**Response:** plain JSON (`ToolRecs`): `recommendations[]` — **one entry per `top_problem` brief**, each `{ problem, final_recommendation, tools: Tool[] }` with up to **4** tools (`platform_integrated` / `highest_roi`). The backend normalises model output so every tool field is always present (`"Not publicly available"` when unverified). See [Parsing LLM output](#parsing-llm-output-for-the-ui).
 
-**500** — show `detail`, keep report on screen, offer retry.
+**Errors**
+
+| Code | Meaning |
+|------|---------|
+| 404 | Unknown `dataset_id` |
+| 409 | Upload exists but analyze never ran |
+| 422 | No confident `top_problems` to research |
+| 500 | OpenRouter / LLM failure — show `detail`, keep report on screen, offer retry |
 
 ---
 
@@ -262,7 +275,7 @@ A chat where an AI interrogator drills the owner on **one problem at a time** un
 
 How it behaves:
 
-- Only **one problem is in focus**. When the owner switches topic, the backend **drops the old problem and its working context**, adopts the new one, and **re-runs the tools pipeline** (`get_tools`) for it **in the background**. Tools run again once the problem becomes "understood".
+- Only **one problem is in focus**. When the owner switches topic, the backend **drops the old problem and its working context**, adopts the new one, and **re-runs the tools pipeline** (`get_tools` on a single brief built from that problem + `known_facts`) **in the background**. Tools run again when the problem becomes **newly** `understood` (or when the problem text changes while understood).
 - The transcript is never wiped: a switch is recorded as a message with `role: "event"` and `type: "problem_changed"` so the UI can draw a divider.
 - A problem only becomes `understood: true` after **≥ 3 owner answers** on it and `clarity ≥ 85`.
 - Sessions live in server memory (lost on restart, like `dataset_id`).
@@ -270,15 +283,21 @@ How it behaves:
 ### 1. Create a session
 
 ```ts
-const session = await fetch(`${API}/chat/sessions`, {
+// Body is optional — omit it for a chat with no upload context (tools still work from conversation)
+const createRes = await fetch(`${API}/chat/sessions`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ dataset_id }), // body optional; dataset_id may be "demo"
-}).then((r) => r.json() as Promise<ChatSession>);
-// session.messages[0] is the grilling opener — render it
+  body: JSON.stringify({ dataset_id: datasetId ?? null }), // omit entire body if always null
+});
+const created = await createRes.json();
+if (!createRes.ok) {
+  throw new Error(typeof created.detail === "string" ? created.detail : JSON.stringify(created.detail));
+}
+const session = created as ChatSession;
+// session.messages[0] is the grilling opener (assistant) — render it
 ```
 
-Errors: **404** unknown / un-analyzed `dataset_id`.
+When `dataset_id` is set (upload id or `"demo"`), the server loads that restaurant’s analysed report and injects name + `top_problems` summaries into the grill context. **`dataset_id` rules match `/tools`** (404 unknown id, 409 if upload not analyzed yet).
 
 ### 2. Send a message (SSE stream)
 
@@ -348,12 +367,14 @@ Only show `result` when `tools.problem` matches the current problem; a run for a
 
 | Code | When |
 |------|------|
-| 404 | Unknown `session_id` (or `dataset_id` on create) |
-| 409 | Previous message is still streaming — disable the input until `done` |
-| 422 | Empty or too-long `message` |
-| 500 | `OPENROUTER_API_KEY` missing |
+| 404 | Unknown `session_id`; or unknown `dataset_id` on create |
+| 409 | Previous message is still streaming — disable the input until `done`; or `dataset_id` upload not analyzed |
+| 422 | Empty or too-long `message` (validation on `ChatMessageIn`) |
+| 500 | Missing `OPENROUTER_API_KEY` or OpenRouter failure before the stream starts |
 
-The chat model defaults to `openai/gpt-4o-mini`; set `CHAT_STREAM_MODEL` in `.env` to override.
+Mid-stream failures arrive as SSE `event: error` with `{ message }` (HTTP stays 200). Chat model: `CHAT_STREAM_MODEL` (see env vars at the top).
+
+**When tool research starts** (you get SSE `tools` + background work): the owner **switches** to a new problem, or the current problem becomes **`understood`** (including when the problem text changes while already understood). The first owner message always counts as a new problem focus, so research usually starts immediately.
 
 ---
 
@@ -403,13 +424,14 @@ type ChatMessage = {
 
 type ChatSession = {
   session_id: string;
+  created_at: number; // unix seconds
   problem: string | null;
   problem_version: number;
   understood: boolean;
-  clarity: number;
+  clarity: number; // 0–100
   known_facts: string[];
   open_questions: string[];
-  messages: ChatMessage[];
+  messages: ChatMessage[]; // full transcript; never wiped on problem switch
   tools: ToolsState;
 };
 
@@ -454,7 +476,7 @@ Same object from `POST /analyze`, `GET /report`, or (dev only) `GET /demo`.
 | `tool_tags` | Catalog filters (not LLM) |
 | `missing` | What CSV types would help |
 
-Pass **`top_problems`** (or a trimmed payload: `label`, `summary`, `category`, `cost`, `time`) into tooling once the backend accepts the user’s analysis — not on every alpha tweak.
+Tooling does **not** accept a custom problem list from the client — it always derives briefs from `GET /tools?dataset_id=`. Chat tooling uses the in-session problem brief only (see Stage 5).
 
 ---
 
@@ -464,7 +486,7 @@ Pass **`top_problems`** (or a trimmed payload: `label`, `summary`, `category`, `
 
 1. `GET /tools`: `await response.json()` → `{ recommendations: [...] }`.
 2. Chat: `tools.result` is already parsed by the backend (same `ToolRecs` object). If it is a **string**, parsing failed — show it as plain text. If `tools.status` is `"error"`, show `tools.error` and offer retry.
-3. Render one section per `recommendations[]` entry (the chat has one problem in focus, so usually one), a card per tool grouped by `category`, and `final_recommendation` as a callout.
+3. **Dashboard** (`GET /tools`): render one section per `recommendations[]` entry (typically aligned with `top_problems`). **Chat** (`tools.result`): usually **one** recommendation for the problem in focus. Group tool cards by `category`; show `final_recommendation` as a callout.
 4. Disclaimer: AI-generated — verify pricing and integrations on vendor sites.
 
 ---
@@ -473,13 +495,13 @@ Pass **`top_problems`** (or a trimmed payload: `label`, `summary`, `category`, `
 
 | Method | Path | When to call |
 |--------|------|----------------|
-| `GET` | `/health` | App boot |
-| `GET` | `/taxonomy` | Static labels / `tool_tags` glossary |
+| `GET` | `/health` | Boot check → `{ "ok": true }` |
+| `GET` | `/taxonomy` | Category list for labels / `tool_tags` glossary |
 | `POST` | `/uploads` | User submits files (**build dataset**) |
-| `POST` | `/analyze/{dataset_id}` | Once per upload |
-| `GET` | `/report/{dataset_id}` | Alpha slider / refresh view |
-| `GET` | `/demo` | **Dev / fallback only** — skip ingest |
-| `GET` | `/tools` | **After** report; long wait; **demo problems today** |
+| `POST` | `/analyze/{dataset_id}?alpha=` | Once per upload; returns full report |
+| `GET` | `/report/{dataset_id}?alpha=` | Alpha slider / refresh (requires prior analyze) |
+| `GET` | `/demo?alpha=` | **Dev / fallback** — synthetic report; pair with `dataset_id=demo` for tools/chat |
+| `GET` | `/tools?dataset_id=&alpha=` | **After** analyze (or `dataset_id=demo`); long wait; LLM from that report’s `top_problems` |
 | `POST` | `/chat/sessions` | Open the grill-me chat (optional `dataset_id`) |
 | `POST` | `/chat/sessions/{session_id}/messages` | Each owner message; **SSE** reply |
 | `GET` | `/chat/sessions/{session_id}` | Restore transcript / poll tool recommendations |
@@ -491,8 +513,8 @@ Pass **`top_problems`** (or a trimmed payload: `label`, `summary`, `category`, `
 |------|------|
 | 404 | Unknown `dataset_id` or `session_id` |
 | 409 | `GET /report` before analyze; or a chat message sent while the previous one is still streaming |
-| 422 | Bad upload, `alpha`, or empty/too-long chat `message` |
-| 500 | Tooling / LLM failure; missing `OPENROUTER_API_KEY` |
+| 422 | Bad upload / `alpha`; tools with no confident problems; empty/too-long chat `message` |
+| 500 | `GET /tools` LLM failure; chat message when `OPENROUTER_API_KEY` missing or unreachable |
 
 ---
 
@@ -518,8 +540,8 @@ curl -s -X POST "$API/analyze/$ID?alpha=0.7" | python3 -c "import json,sys; r=js
 # 3) Re-rank
 curl -s "$API/report/$ID?alpha=1.0" | python3 -c "import json,sys; r=json.load(sys.stdin); print([p['label'] for p in r['top_problems']])"
 
-# 4) Tools (slow; optional)
-curl -s "$API/tools" | head -c 200
+# 4) Tools (slow; optional) — same dataset_id as analyze
+curl -s "$API/tools?dataset_id=$ID&alpha=0.7" | python3 -c "import json,sys; r=json.load(sys.stdin); print(len(r.get('recommendations',[])), r['recommendations'][0]['tools'][0]['tool_name'] if r.get('recommendations') else 'err')"
 
 # 5) Grill chat (-N disables buffering so tokens print live)
 SID=$(curl -s -X POST "$API/chat/sessions" | python3 -c "import json,sys; print(json.load(sys.stdin)['session_id'])")
@@ -532,14 +554,14 @@ curl -s "$API/chat/sessions/$SID" | python3 -c "import json,sys; s=json.load(sys
 
 ---
 
-## Backend coordination checklist
+## Backend source map
 
-| Need | Owner |
-|------|--------|
-| Tools use **uploaded** `top_problems` | `api.py` — new route keyed by `dataset_id` |
-| Report shape | `backend/ranker.py` |
-| Ingest / mapping | `backend/ingest/loader.py` |
-| LLM prompt / response | `backend/tool_rec/llmConnection.py` |
-| Grill chat (prompts, problem switching, SSE) | `backend/chat_stream/` (routes in `api.py`) |
+| Concern | Module |
+|---------|--------|
+| Routes, CORS, in-memory `dataset_id` / chat sessions | `backend/api.py` |
+| Report shape, `top_problems`, `alpha` blending | `backend/ranker.py` |
+| Ingest / `build_dataset` | `backend/ingest/loader.py` |
+| Tool LLM (`get_tools`, `ToolRecs` schema) | `backend/tool_rec/llmConnection.py` |
+| Grill chat (prompts, SSE, background tools) | `backend/chat_stream/` |
 
-**Frontend is correct when:** upload builds the dataset once, analyze runs once, slider uses GET report, tooling is optional and slow and runs last — and tools consume the **same** `top_problems` the user already sees on the dashboard.
+**Frontend is correct when:** upload builds the dataset once, analyze runs once, the slider uses `GET /report` only, tooling is optional and slow with `GET /tools?dataset_id=` matching the visible report, and chat polls `GET /chat/sessions/{id}` for `tools.result` after SSE `done`.
