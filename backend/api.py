@@ -7,8 +7,12 @@ from __future__ import annotations
 import json
 import uuid
 from functools import lru_cache
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.ingest.dataset import Dataset, Profile
@@ -85,14 +89,15 @@ def _demo_analysis() -> Analysis:
 
 @app.get("/demo")
 def demo(alpha: float = Alpha):
-    return build_report(_demo_analysis(), alpha)
+    demo_report = build_report(_demo_analysis(), alpha)
+    print("built report")
+    return demo_report
 
 @app.get("/tools")
 def tools():
-    tool_rec = None
     try:
-        build_report_json = demo()
-        tool_recs = get_tools(problems=build_report_json['restaurant']['top_problems'])
+        build_report_json = demo(alpha=DEFAULT_ALPHA)
+        tool_recs = get_tools(problems=build_report_json['top_problems'])
     except Exception as e:
         raise HTTPException(500, f"Error getting tools: {e}")
     return tool_recs
