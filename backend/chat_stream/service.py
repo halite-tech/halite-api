@@ -78,6 +78,8 @@ async def _analyze(session: ChatSession, user_message: str) -> dict:
 
 
 def _parse_tools(raw: Any) -> Any:
+    if isinstance(raw, dict):
+        return raw
     if isinstance(raw, str):
         try:
             return json.loads(raw)

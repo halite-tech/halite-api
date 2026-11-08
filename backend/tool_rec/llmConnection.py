@@ -1,101 +1,170 @@
+"""AI-tool recommendations for restaurant problems.
+
+Two OpenRouter calls, because one call cannot do both jobs reliably:
+
+1. Research (Responses API + ``openrouter:web_fetch``): free-form notes about candidate tools.
+   Models do NOT honour a strict JSON schema once server tools are attached -- they silently drop
+   required keys (``tool_pricing``, ``tool_number``, ``final_recommendation`` ...), which is what
+   broke the frontend parsing.
+2. Structuring (Chat Completions, no tools, strict ``json_schema``): turns the notes into the exact
+   shape the frontend expects.
+
+The result is then normalised in Python so the output *always* has the full shape, no matter what
+the model did.
+"""
+from __future__ import annotations
+
+import json
+import os
+from typing import Any
+
 import requests
 
-import os
+RESPONSES_URL = "https://openrouter.ai/api/v1/responses"
+CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "openai/gpt-4o-mini"
+NOT_AVAILABLE = "Not publicly available"
+CATEGORIES = ("platform_integrated", "highest_roi")
 
-def prompt_tools(problems: list[str]) -> list[str]:
-    prompt = f"""
-    You are an experienced restaurant owner with 10+ years of operational experience. Your goal is to identify the best AI tools to solve each of the restaurant's problems listed below.
+TOOL_ITEM_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "tool_number": {"type": "integer"},
+        "tool_name": {"type": "string"},
+        "tool_description": {"type": "string"},
+        "tool_pricing": {"type": "string"},
+        "tool_home_page": {"type": "string"},
+        "category": {"type": "string", "enum": list(CATEGORIES)},
+    },
+    "required": [
+        "tool_number",
+        "tool_name",
+        "tool_description",
+        "tool_pricing",
+        "tool_home_page",
+        "category",
+    ],
+    "additionalProperties": False,
+}
 
-    For **EACH problem**, find exactly **4 AI tools**, divided into two categories:
+TOOL_REC_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "recommendations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "problem": {"type": "string"},
+                    "final_recommendation": {"type": "string"},
+                    "tools": {
+                        "type": "array",
+                        "items": TOOL_ITEM_SCHEMA,
+                    },
+                },
+                "required": ["problem", "tools", "final_recommendation"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["recommendations"],
+    "additionalProperties": False,
+}
 
-    **Category 1: Platform-integrated solutions (2 tools)**
-    - Find 2 tools that can be directly downloaded, installed, or integrated into the platforms and software I already use.
-    - Prioritize ease of implementation, compatibility, and minimal disruption to existing workflows.
 
-    **Category 2: Highest business ROI (2 tools)**
-    - Find 2 tools that offer the greatest potential to reduce operating costs, increase revenue, or improve profitability.
-    - Prioritize measurable ROI, reliability, proven results, and ease of employee adoption.
+def _model() -> str:
+    return (os.getenv("TOOL_REC_MODEL") or DEFAULT_MODEL).strip()
 
-    **For every tool, provide:**
-    1. **Tool name and homepage:** Link directly to its official website.
-    2. **Pricing:** Provide pricing plans or estimated costs. Clearly distinguish publicly listed prices from custom/quote-based pricing.
-    3. **Core functionality:** Explain exactly how the tool addresses the specific problem.
-    4. **Platform compatibility:** Identify which existing restaurant platforms it integrates with and how the integration works.
-    5. **ROI:** Explain the expected financial or operational benefits. Include quantified results where supported by credible evidence.
-    6. **Reliability:** Evaluate its track record, customer reviews, and evidence of effectiveness.
-    7. **Adoptability:** Assess implementation difficulty, employee training requirements, and how easily it fits into restaurant operations.
 
-    **Research requirements:**
-    - Conduct thorough research. Accuracy and reliability are more important than speed.
-    - Prioritize established products with real restaurant customers and proven use cases.
-    - Verify that each product is currently available and that its integrations and pricing are accurate.
-    - Use official product websites, documentation, pricing pages, customer case studies, and credible third-party reviews.
-    - Do not recommend tools simply because they advertise AI capabilities. They must meaningfully solve the stated problem.
-    - Avoid recommending the same tool repeatedly unless it genuinely provides the best solution for multiple problems.
-    - Do not fabricate pricing, integrations, ROI figures, or customer results. Explicitly label information that cannot be verified.
-    - If fewer than 4 credible solutions exist for a problem, explain this rather than padding the results with weak recommendations.
+def _problem_list(problems: list[str]) -> str:
+    return "\n".join(f"- {p}" for p in problems)
 
-    **Final output:**
-    Organize the research by problem, with exactly 4 recommendations per problem whenever credible options exist. Clearly distinguish the 2 platform-integrated tools from the 2 highest-ROI alternatives.
 
-    End each problem's section with a brief comparison identifying which tool you would actually choose as a restaurant owner and why.
+def prompt_research(problems: list[str]) -> str:
+    return f"""
+You are an experienced restaurant owner with 10+ years of operational experience. Identify the best AI tools to solve each problem listed below.
 
-    **STRICT OUTPUT FORMAT REQUIREMENT**
+For **EACH problem**, find exactly **4 AI tools**:
+- 2 **platform_integrated** tools that fit an existing restaurant POS/ops stack.
+- 2 **highest_roi** tools with strong cost/revenue impact.
 
-    The entire response MUST follow the exact hierarchical structure below. Do not use tables. Do not group tools into separate sections outside their respective problems. Every problem must contain its own 4 tools.
+For every tool, research: homepage URL, pricing, how it solves the problem, integrations, ROI, reliability, and adoptability.
+Use credible sources only; write "{NOT_AVAILABLE}" when you cannot verify a field.
+The tools must be real, currently available products that are directly relevant to the problem.
 
-    Problem 1: [Problem name]
+**Problems to research:**
+{_problem_list(problems)}
 
-    - Tool 1: [Tool name]
-    - Category: Platform-integrated / Highest ROI
-    - Homepage:
-    - Pricing:
-    - Core functionality:
-    - How it solves the problem:
-    - Platform compatibility:
-    - Expected ROI:
-    - Reliability:
-    - Adoptability:
+Write concise research notes grouped by problem (same order), ending each problem with a one-paragraph
+final recommendation: which single tool you would pick and why.
+"""
 
-    - Tool 2: [Same structure]
-    - Tool 3: [Same structure]
-    - Tool 4: [Same structure]
 
-    - Final recommendation: [Which tool you would choose and why.]
+def prompt_structure(problems: list[str], notes: str) -> str:
+    return f"""
+Convert the research notes below into JSON that matches the response schema exactly.
 
-    Problem 2: [Problem name]
+Rules:
+- `recommendations` has exactly one entry per problem, in the same order as the problems list.
+- `problem` repeats the problem text. `final_recommendation` is the owner's pick and why.
+- `tools` has exactly 4 entries per problem: 2 with category `platform_integrated`, 2 with `highest_roi`.
+  `tool_number` runs 1-4 within each problem.
+- `tool_description` is the full narrative for the tool (what it does, how it solves the problem,
+  integrations, ROI, reliability, adoptability).
+- `tool_pricing` is a short pricing summary; `tool_home_page` is a full URL.
+- Use "{NOT_AVAILABLE}" for any field the notes do not support. Never invent facts.
 
-    - Tool 1:
-    [Repeat the exact same structure.]
+Problems:
+{_problem_list(problems)}
 
-    - Tool 2:
-    - Tool 3:
-    - Tool 4:
+Research notes:
+{notes}
+"""
 
-    - Final recommendation:
 
-    Continue this exact structure for every problem provided.
+def _json_from_model_text(text: str) -> dict[str, Any]:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    parsed = json.loads(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("model output was not a JSON object")
+    return parsed
 
-    **Formatting rules:**
-    1. Every problem must have its own heading.
-    2. Every problem must contain exactly 4 tools whenever 4 credible solutions exist.
-    3. Each tool must contain all 9 information fields listed above.
-    4. Never combine multiple problems under one heading.
-    5. Never move tools into a separate consolidated list or comparison table.
-    6. Maintain identical formatting and field order throughout the entire response.
-    7. Do not omit fields; use "Not publicly available" when information cannot be verified.
-    8. Keep all recommendations directly under the problem they address.
 
-    **Problems to research:**
+def _openrouter_error(data: Any) -> str | None:
+    """Return a user-facing error string, or None when the payload is OK (error may be null)."""
+    if not isinstance(data, dict):
+        return None
+    err = data.get("error")
+    if not err:
+        return None
+    if isinstance(err, dict):
+        return f"{err.get('code', 'error')}: {err.get('message', err)}"
+    return str(err)
 
-    {problems}
-    """
-    return prompt
 
-def get_tools(problems: list[str]) -> list[str]:
-    print("getting tools")
-    prompt = prompt_tools(problems)
-    print("prompt:")
+def _extract_output_text(data: dict[str, Any]) -> str:
+    """Final assistant text from a Responses API payload."""
+    output = data.get("output")
+    if not isinstance(output, list):
+        raise RuntimeError("unexpected OpenRouter response: missing output")
+    message = next((item for item in reversed(output) if item.get("type") == "message"), None)
+    if not message:
+        raise RuntimeError("unexpected OpenRouter response: no message in output")
+    content = message.get("content") or []
+    text = next((part.get("text") for part in content if part.get("type") == "output_text"), None)
+    if not text:
+        raise RuntimeError("unexpected OpenRouter response: no output_text")
+    return text
+
+
+def _post(url: str, body: dict[str, Any], timeout: int) -> dict[str, Any]:
     key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
     if not key:
         raise RuntimeError(
@@ -103,53 +172,104 @@ def get_tools(problems: list[str]) -> list[str]:
             "(python-dotenv loads .env in backend.api on startup)."
         )
     response = requests.post(
-            "https://openrouter.ai/api/v1/responses",
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "openai/gpt-4o-mini-2024-07-18",
-                "input": prompt,
-                "tools": [
-                    {
-                        "type": "openrouter:web_fetch",
-                        "parameters": {
-                            "max_uses": 4,
-                        },
-                    }
-                ],
-                "text": {
-                    "format": {
-                        "type": "json_schema",
-                        "name": "tool_rec",
-                        "strict": True,
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "tool_number": {"type": "integer"},
-                                "tool_name": {"type": "string"},
-                                "tool_description": {"type": "string"},
-                                "tool_pricing": {"type": "string"},
-                                "tool_home_page": {"type": "string"},
-                            },
-                            "required": ["tool_number", "tool_name", "tool_description", "tool_pricing", "tool_home_page"],
-                            "additionalProperties": False,
-                        },
-                    }
-                },
-            },
-        )
-    data = response.json()
-    # if "error" in data:
-    #     raise RuntimeError(f"{data['error']['code']}: {data['error']['message']}")
-
-    message = next(item for item in reversed(data["output"]) if item["type"] == "message")
-    result = next(part["text"] for part in message["content"] if part["type"] == "output_text")
-    print(result)  # JSON string matching your schema
-    return result
-    # except Exception as e:
-    #     print("error: ", e)
-    #     return None
+        url,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json=body,
+        timeout=timeout,
+    )
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"{response.status_code}: non-JSON response from OpenRouter") from exc
+    if msg := _openrouter_error(data):
+        raise RuntimeError(msg)
+    if response.status_code >= 400:
+        raise RuntimeError(f"{response.status_code}: {data}")
+    if not isinstance(data, dict):
+        raise RuntimeError("unexpected OpenRouter response: not a JSON object")
+    return data
 
 
+def _research(problems: list[str]) -> str:
+    """Stage 1: web-assisted research notes. Falls back to model knowledge if web_fetch fails."""
+    body: dict[str, Any] = {
+        "model": _model(),
+        "input": prompt_research(problems),
+        "tools": [{"type": "openrouter:web_fetch", "parameters": {"max_uses": 4}}],
+    }
+    try:
+        return _extract_output_text(_post(RESPONSES_URL, body, timeout=180))
+    except RuntimeError:
+        body.pop("tools")  # web tool unavailable/failed: still answer from the model's own knowledge
+        return _extract_output_text(_post(RESPONSES_URL, body, timeout=120))
+
+
+def _structure(problems: list[str], notes: str) -> dict[str, Any]:
+    """Stage 2: strict-schema JSON from the notes (no tools, so the schema is enforced)."""
+    body = {
+        "model": _model(),
+        "temperature": 0,
+        "messages": [{"role": "user", "content": prompt_structure(problems, notes)}],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "tool_rec", "strict": True, "schema": TOOL_REC_SCHEMA},
+        },
+    }
+    data = _post(CHAT_URL, body, timeout=120)
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("unexpected OpenRouter response: no message content") from exc
+    return _json_from_model_text(text)
+
+
+def _text(value: Any, default: str = "") -> str:
+    return value.strip() if isinstance(value, str) and value.strip() else default
+
+
+def _headline(problem: str) -> str:
+    """First line of a (possibly multi-line) problem brief."""
+    return next((ln.strip() for ln in problem.splitlines() if ln.strip()), problem.strip())
+
+
+def normalize_recommendations(raw: dict[str, Any], problems: list[str]) -> dict[str, Any]:
+    """Guarantee the frontend shape: one entry per problem, every tool has every field."""
+    recs_in = raw.get("recommendations")
+    if not isinstance(recs_in, list):
+        raise ValueError("missing 'recommendations' list")
+    recs_out: list[dict[str, Any]] = []
+    for i, problem in enumerate(problems):
+        rec = recs_in[i] if i < len(recs_in) and isinstance(recs_in[i], dict) else {}
+        tools: list[dict[str, Any]] = []
+        for t in rec.get("tools") or []:
+            if not isinstance(t, dict) or not _text(t.get("tool_name")):
+                continue
+            category = t.get("category")
+            tools.append({
+                "tool_number": len(tools) + 1,
+                "tool_name": _text(t.get("tool_name")),
+                "tool_description": _text(t.get("tool_description"), NOT_AVAILABLE),
+                "tool_pricing": _text(t.get("tool_pricing"), NOT_AVAILABLE),
+                "tool_home_page": _text(t.get("tool_home_page"), NOT_AVAILABLE),
+                "category": category if category in CATEGORIES else "highest_roi",
+            })
+        recs_out.append({
+            "problem": _text(rec.get("problem"), _headline(problem)),
+            "final_recommendation": _text(rec.get("final_recommendation")),
+            "tools": tools,
+        })
+    if not any(r["tools"] for r in recs_out):
+        raise ValueError("model returned no usable tools")
+    return {"recommendations": recs_out}
+
+
+def get_tools(problems: list[str]) -> dict[str, Any]:
+    """Return ``{"recommendations": [{problem, final_recommendation, tools: [...]}, ...]}``."""
+    notes = _research(problems)
+    last_error: Exception | None = None
+    for _ in range(2):  # structuring is cheap; retry once on a malformed/empty answer
+        try:
+            return normalize_recommendations(_structure(problems, notes), problems)
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+    raise RuntimeError(f"invalid tool JSON from model: {last_error}")

@@ -28,7 +28,7 @@ from backend.synthetic.generate import generate
 from backend.tool_rec.llmConnection import get_tools
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:3001"], allow_methods=["*"], allow_headers=["*"])
 
 # In-memory store; fine for a prototype, swap for a database in production.
 DATASETS: dict[str, Dataset] = {}
@@ -98,14 +98,39 @@ def demo(alpha: float = Alpha):
     print("built report")
     return demo_report
 
+
+def _analysis_for_dataset(dataset_id: str) -> Analysis:
+    if dataset_id == "demo":
+        return _demo_analysis()
+    if dataset_id in ANALYSES:
+        return ANALYSES[dataset_id]
+    if dataset_id in DATASETS:
+        raise HTTPException(409, "dataset not analyzed yet; POST /analyze/{dataset_id} first")
+    raise HTTPException(404, "unknown dataset_id")
+
+
+def _problem_briefs_for_tools(report: dict) -> list[str]:
+    briefs: list[str] = []
+    for p in report.get("top_problems") or []:
+        label = (p.get("label") or p.get("category") or "Problem").strip()
+        summary = (p.get("summary") or "").strip()
+        briefs.append(f"{label}: {summary}" if summary else label)
+    return briefs
+
+
 @app.get("/tools")
-def tools():
+def tools(
+    dataset_id: str = Query(..., description="Analyzed upload id, or 'demo' for synthetic data"),
+    alpha: float = Alpha,
+):
+    report = build_report(_analysis_for_dataset(dataset_id), alpha)
+    problems = _problem_briefs_for_tools(report)
+    if not problems:
+        raise HTTPException(422, "no confident top problems to research; POST /analyze after upload")
     try:
-        build_report_json = demo(alpha=DEFAULT_ALPHA)
-        tool_recs = get_tools(problems=build_report_json['top_problems'])
+        return get_tools(problems)
     except Exception as e:
         raise HTTPException(500, f"Error getting tools: {e}")
-    return tool_recs
 
 # --------------------------------------------------------------------------- grill-me chat
 class ChatSessionIn(BaseModel):
@@ -119,12 +144,7 @@ class ChatMessageIn(BaseModel):
 def _chat_context(dataset_id: str | None) -> str | None:
     if not dataset_id:
         return None
-    if dataset_id == "demo":
-        analysis = _demo_analysis()
-    elif dataset_id in ANALYSES:
-        analysis = ANALYSES[dataset_id]
-    else:
-        raise HTTPException(404, "unknown or un-analyzed dataset_id")
+    analysis = _analysis_for_dataset(dataset_id)
     rep = build_report(analysis)
     lines = [f"Restaurant: {rep['restaurant']['name']}"]
     lines += [f"- {p['summary']}" for p in rep["top_problems"]]

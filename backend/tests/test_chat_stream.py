@@ -34,7 +34,7 @@ def fake_llm(monkeypatch):
 
     def fake_get_tools(problems):
         tool_calls.append(problems)
-        return json.dumps({"tool_name": "T", "for": problems[0]})
+        return {"tool_name": "T", "for": problems[0]}
 
     monkeypatch.setattr(service, "complete_json", fake_complete_json)
     monkeypatch.setattr(service, "stream_chat", fake_stream_chat)

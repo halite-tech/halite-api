@@ -34,9 +34,11 @@ def _headers() -> dict[str, str]:
 
 def _error_text(payload) -> str:
     err = payload.get("error") if isinstance(payload, dict) else None
+    if not err:
+        return str(payload)[:300]
     if isinstance(err, dict):
         return f"{err.get('code', 'error')}: {err.get('message', err)}"
-    return str(err or payload)[:300]
+    return str(err)[:300]
 
 
 async def complete_json(messages: list[dict], name: str, schema: dict, temperature: float = 0.0) -> dict:
@@ -56,7 +58,7 @@ async def complete_json(messages: list[dict], name: str, schema: dict, temperatu
         data = resp.json()
     except ValueError:
         raise OpenRouterError(f"{resp.status_code}: non-JSON response from OpenRouter")
-    if resp.status_code >= 400 or "error" in data:
+    if resp.status_code >= 400 or (isinstance(data, dict) and data.get("error")):
         raise OpenRouterError(_error_text(data))
     try:
         return json.loads(data["choices"][0]["message"]["content"])
@@ -86,7 +88,7 @@ async def stream_chat(messages: list[dict], temperature: float = 0.7) -> AsyncIt
                     chunk = json.loads(payload)
                 except ValueError:
                     continue
-                if "error" in chunk:  # mid-stream failure
+                if isinstance(chunk, dict) and chunk.get("error"):  # mid-stream failure
                     raise OpenRouterError(_error_text(chunk))
                 choices = chunk.get("choices") or []
                 delta = (choices[0].get("delta") or {}).get("content") if choices else None

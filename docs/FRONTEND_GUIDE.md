@@ -245,12 +245,12 @@ const raw = await fetch(`${API}/tools`, {
     const err = await r.json();
     throw new Error(err.detail ?? "tools failed");
   }
-  return r.json() as Promise<string>; // body is a JSON-encoded string
+  return r.json() as Promise<ToolRecs>; // plain JSON object, no second parse
 });
-const tool = JSON.parse(raw) as ToolRec; // the string itself contains JSON text
+const recs = raw.recommendations; // one entry per problem, each with up to 4 tools
 ```
 
-**Response:** `application/json` body is a **string** that itself contains **JSON text** matching the strict schema in `llmConnection.py`: `{ tool_number, tool_name, tool_description, tool_pricing, tool_home_page }`. Parse twice (`r.json()` then `JSON.parse`). Today the schema describes a **single tool object**, not an array per problem. See [Parsing LLM output](#parsing-llm-output-for-the-ui) below.
+**Response:** a plain JSON object (`ToolRecs`, see types below): `recommendations[]`, one per problem, each `{ problem, final_recommendation, tools: Tool[] }` with 4 tools (`platform_integrated` / `highest_roi`). The backend normalises the model output, so every field is always present (`"Not publicly available"` when unverified). See [Parsing LLM output](#parsing-llm-output-for-the-ui).
 
 **500** — show `detail`, keep report on screen, offer retry.
 
@@ -331,7 +331,7 @@ Tools run **30–90+ s after** the stream ends, so poll `GET /chat/sessions/{id}
 type ToolsState = {
   status: "idle" | "running" | "ready" | "error";
   problem: string | null; // brief these results were produced for
-  result: ToolRec | string | null; // parsed JSON from get_tools, or raw text if it wasn't JSON
+  result: ToolRecs | string | null; // parsed JSON from get_tools, or raw text if it wasn't JSON
   error: string | null;
   updated_at: number;
 };
@@ -374,17 +374,22 @@ type Session = {
   alpha: number;
   ingest: UploadResponse | null;
   report: Report | null;
-  tools: ToolRec | null;
+  tools: ToolRecs | null;
   toolsError: string | null;
   chat: ChatSession | null; // Stage 5 (independent of the phases above)
 };
 
-type ToolRec = {
-  tool_number: number;
+type Tool = {
+  tool_number: number; // 1-4 within a problem
   tool_name: string;
   tool_description: string;
   tool_pricing: string;
-  tool_home_page: string;
+  tool_home_page: string; // URL, or "Not publicly available"
+  category: "platform_integrated" | "highest_roi";
+};
+
+type ToolRecs = {
+  recommendations: { problem: string; final_recommendation: string; tools: Tool[] }[];
 };
 
 type ChatMessage = {
@@ -455,11 +460,11 @@ Pass **`top_problems`** (or a trimmed payload: `label`, `summary`, `category`, `
 
 ## Parsing LLM output for the UI
 
-`get_tools` forces a strict JSON schema, so the output is **JSON, not Markdown**.
+`get_tools` runs a web-research pass, then a strict-schema structuring pass, then normalises the result, so the output is **JSON, not Markdown**, with a fixed shape.
 
-1. `GET /tools`: `await response.json()` → **string** → `JSON.parse` it → `{ tool_number, tool_name, tool_description, tool_pricing, tool_home_page }`.
-2. Chat: `tools.result` is already parsed by the backend (an object with the same fields). If it is a **string**, parsing failed — show it as plain text.
-3. The schema is currently **one tool object**, not an array per problem. Render it as a single card and don't assume 4 tools per problem; if the backend later returns arrays, reuse the same card component.
+1. `GET /tools`: `await response.json()` → `{ recommendations: [...] }`.
+2. Chat: `tools.result` is already parsed by the backend (same `ToolRecs` object). If it is a **string**, parsing failed — show it as plain text. If `tools.status` is `"error"`, show `tools.error` and offer retry.
+3. Render one section per `recommendations[]` entry (the chat has one problem in focus, so usually one), a card per tool grouped by `category`, and `final_recommendation` as a callout.
 4. Disclaimer: AI-generated — verify pricing and integrations on vendor sites.
 
 ---
