@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -29,7 +30,6 @@ from backend.shared.industries import DEFAULT_INDUSTRY, INDUSTRY_LABELS
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
 from backend.shared.debug import debug, debug_trim
-from backend.storage import create_dataset, delete_file, delete_files, delete_user_files, load_dataset, load_datasets, load_files, load_user_file_metadata, load_user_files, replace_files, upsert_user_files
 from backend.tool_rec.llmConnection import get_tools
 
 def _patch_uvicorn_keep_alive(seconds: int = 300) -> None:
@@ -82,6 +82,7 @@ app.add_middleware(
 # In-memory store; fine for a prototype, swap for a database in production.
 DATASETS: dict[str, Dataset] = {}
 DATASET_OWNERS: dict[str, str] = {}
+DATASET_RAW_FILES: dict[str, list[tuple[str, bytes]]] = {}
 ANALYSES: dict[str, Analysis] = {}
 
 Alpha = Query(DEFAULT_ALPHA, ge=0.0, le=1.0, description="1.0 = rank by money only, 0.0 = by time only")
@@ -124,25 +125,24 @@ def _dataset_summary(dataset_id: str, ds: Dataset) -> dict:
 
 def _owned_dataset(dataset_id: str, user_id: str) -> Dataset:
     ds = DATASETS.get(dataset_id)
-    if ds is None:
-        persisted = load_dataset(user_id, dataset_id)
-        if persisted is not None:
-            profile, files = persisted
-            ds = build_dataset(files, Profile.from_dict(profile))
-            DATASETS[dataset_id] = ds
-            DATASET_OWNERS[dataset_id] = user_id
     if ds is None or DATASET_OWNERS.get(dataset_id) != user_id:
         raise HTTPException(404, "unknown dataset_id")
     return ds
 
 
 def _user_dataset(user_id: str) -> Dataset:
-    profile, files = load_user_files(user_id)
+    dataset_ids = [dataset_id for dataset_id, owner_id in DATASET_OWNERS.items() if owner_id == user_id]
+    if not dataset_ids:
+        raise HTTPException(404, "no files uploaded")
+    files_by_name: dict[str, bytes] = {}
+    profile = None
+    for dataset_id in dataset_ids:
+        files_by_name.update(DATASET_RAW_FILES.get(dataset_id, []))
+        profile = DATASETS[dataset_id].profile
+    files = list(files_by_name.items())
     if not files:
         raise HTTPException(404, "no files uploaded")
-    ds = build_dataset(files, Profile.from_dict(profile or None))
-    DATASETS[user_id] = ds
-    DATASET_OWNERS[user_id] = user_id
+    ds = build_dataset(files, profile)
     return ds
 
 
@@ -153,13 +153,20 @@ def _user_report(user_id: str, alpha: float, industry: str = DEFAULT_INDUSTRY) -
 
 
 def _user_file_summary(user_id: str) -> dict:
-    profile, files = load_user_file_metadata(user_id)
+    dataset_ids = [dataset_id for dataset_id, owner_id in DATASET_OWNERS.items() if owner_id == user_id]
+    files_by_name: dict[str, tuple[int, float]] = {}
+    profile = {}
+    for dataset_id in dataset_ids:
+        ds = DATASETS[dataset_id]
+        profile = ds.profile.to_dict()
+        for filename, payload in DATASET_RAW_FILES.get(dataset_id, []):
+            files_by_name[filename] = (len(payload), time.time() * 1000)
     return {
         "dataset_id": "context",
         "name": profile.get("name", "Business context"),
         "files": [
             {"name": filename, "filename": filename, "size": size, "last_modified": uploaded_at}
-            for filename, size, uploaded_at in files
+            for filename, (size, uploaded_at) in files_by_name.items()
         ],
         "profile": profile,
     }
@@ -181,8 +188,14 @@ async def upload_context(
     except (json.JSONDecodeError, TypeError) as exc:
         raise HTTPException(400, f"profile must be a JSON object: {exc}")
     raw = [(f.filename or "upload.csv", await f.read()) for f in files]
-    upsert_user_files(user_id, profile_data, raw)
-    ANALYSES.pop(user_id, None)
+    dataset_ids = [dataset_id for dataset_id, owner_id in DATASET_OWNERS.items() if owner_id == user_id]
+    dataset_id = dataset_ids[0] if dataset_ids else uuid.uuid4().hex[:12]
+    existing = dict(DATASET_RAW_FILES.get(dataset_id, []))
+    existing.update(raw)
+    DATASET_RAW_FILES[dataset_id] = list(existing.items())
+    DATASETS[dataset_id] = build_dataset(DATASET_RAW_FILES[dataset_id], Profile.from_dict(profile_data or None))
+    DATASET_OWNERS[dataset_id] = user_id
+    ANALYSES.pop(dataset_id, None)
     return _user_file_summary(user_id)
 
 
@@ -190,11 +203,12 @@ async def upload_context(
 def delete_context_files(filenames: list[str], user_id: str = Depends(current_user_id)):
     if not filenames:
         raise HTTPException(400, "filenames must contain at least one filename")
-    _, files = load_user_file_metadata(user_id)
-    known = {filename for filename, _, _ in files}
-    delete_user_files(user_id, [filename for filename in filenames if filename in known])
-    DATASETS.pop(user_id, None)
-    ANALYSES.pop(user_id, None)
+    dataset_ids = [dataset_id for dataset_id, owner_id in DATASET_OWNERS.items() if owner_id == user_id]
+    for dataset_id in dataset_ids:
+        remaining = [(filename, payload) for filename, payload in DATASET_RAW_FILES.get(dataset_id, []) if filename not in filenames]
+        DATASET_RAW_FILES[dataset_id] = remaining
+        DATASETS[dataset_id] = build_dataset(remaining, DATASETS[dataset_id].profile)
+        ANALYSES.pop(dataset_id, None)
     return _user_file_summary(user_id)
 
 
@@ -331,10 +345,6 @@ def list_datasets(user_id: str = Depends(current_user_id)):
     results remain in memory and are rebuilt on demand after a restart. `demo` is listed
     only after `/demo` (or tools/chat with dataset_id=demo) has built the synthetic analysis.
     """
-    if not DATASETS:
-        for dataset_id, owner_id, profile, files in load_datasets():
-            DATASETS[dataset_id] = build_dataset(files, Profile.from_dict(profile))
-            DATASET_OWNERS[dataset_id] = owner_id
     items = [_dataset_summary(i, ds) for i, ds in DATASETS.items() if DATASET_OWNERS.get(i) == user_id]
     if _demo_analysis.cache_info().currsize:
         items.append(_dataset_summary("demo", _demo_analysis().dataset))
@@ -368,14 +378,14 @@ async def upload(
 
     if dataset_id:
         ds = _owned_dataset(dataset_id, user_id)
-        replace_files(user_id, dataset_id, raw)
-        DATASETS[dataset_id] = build_dataset(load_files(user_id, dataset_id), ds.profile)
+        DATASET_RAW_FILES[dataset_id] = raw
+        DATASETS[dataset_id] = build_dataset(raw, ds.profile)
         ANALYSES.pop(dataset_id, None)
     else:
         dataset_id = uuid.uuid4().hex[:12]
-        create_dataset(user_id, dataset_id, (prof or incoming.profile).to_dict(), raw)
         DATASETS[dataset_id] = build_dataset(raw, prof)
         DATASET_OWNERS[dataset_id] = user_id
+        DATASET_RAW_FILES[dataset_id] = raw
     ds = DATASETS[dataset_id]
     return {
         "dataset_id": dataset_id,
@@ -393,10 +403,12 @@ def delete_dataset_file(dataset_id: str, filename: str = Query(..., min_length=1
     if report_index is None:
         raise HTTPException(404, "unknown file")
 
-    if not delete_file(user_id, dataset_id, filename):
+    remaining = [(name, payload) for name, payload in DATASET_RAW_FILES[dataset_id] if name != filename]
+    if len(remaining) == len(DATASET_RAW_FILES[dataset_id]):
         raise HTTPException(404, "unknown file")
     profile = ds.profile
-    DATASETS[dataset_id] = build_dataset(load_files(user_id, dataset_id), profile)
+    DATASET_RAW_FILES[dataset_id] = remaining
+    DATASETS[dataset_id] = build_dataset(remaining, profile)
     ANALYSES.pop(dataset_id, None)
     return _dataset_summary(dataset_id, ds)
 
@@ -411,8 +423,11 @@ def delete_dataset_files(dataset_id: str, filenames: list[str], user_id: str = D
     unknown = [filename for filename in requested if filename not in known]
     if unknown:
         raise HTTPException(404, f"unknown file: {unknown[0]}")
-    delete_files(user_id, dataset_id, requested)
-    DATASETS[dataset_id] = build_dataset(load_files(user_id, dataset_id), ds.profile)
+    DATASET_RAW_FILES[dataset_id] = [
+        (filename, payload) for filename, payload in DATASET_RAW_FILES[dataset_id]
+        if filename not in requested
+    ]
+    DATASETS[dataset_id] = build_dataset(DATASET_RAW_FILES[dataset_id], ds.profile)
     ANALYSES.pop(dataset_id, None)
     return _dataset_summary(dataset_id, DATASETS[dataset_id])
 
@@ -463,7 +478,13 @@ def _analysis_for_dataset(dataset_id: str, user_id: str | None = None) -> Analys
 def _problem_briefs_for_tools(report: dict, selected_problem: str | None = None) -> list[str]:
     briefs: list[str] = []
     if selected_problem and selected_problem.strip():
-        return [selected_problem.strip()]
+        selected = selected_problem.strip()
+        for candidate in report.get("top_problems") or []:
+            label = (candidate.get("label") or candidate.get("category") or "").strip()
+            if label.lower() == selected.lower():
+                summary = (candidate.get("summary") or "").strip()
+                return [f"{label}: {summary}" if summary else label]
+        return [selected]
 
     candidates = report.get("top_problems") or []
     candidates = candidates[:2]
@@ -567,15 +588,13 @@ class ChatMessageIn(BaseModel):
 
 def _chat_context(dataset_id: str | None, user_id: str, industry: str = DEFAULT_INDUSTRY) -> str | None:
     if not dataset_id:
-        if not load_user_files(user_id)[1]:
+        if not any(owner_id == user_id for owner_id in DATASET_OWNERS.values()):
             return None
         analysis = analyze(_user_dataset(user_id), industry=industry)
         rep = build_report(analysis)
         return "\n".join([f"Restaurant: {rep['restaurant']['name']}"] + [f"- {p['summary']}" for p in rep["top_problems"]])
     if dataset_id != "demo" and dataset_id not in ANALYSES and dataset_id in DATASETS:
         _owned_dataset(dataset_id, user_id)
-        # Uploaded files survive restarts; rebuild the in-memory analysis before chat
-        # session creation so the app and chat panel can reload in parallel safely.
         ANALYSES[dataset_id] = analyze(DATASETS[dataset_id])
     analysis = _analysis_for_dataset(dataset_id, user_id)
     rep = build_report(analysis)

@@ -98,7 +98,7 @@ def test_chat_session_rebuilds_analysis_after_restart(client, restaurant):
     assert dataset_id in ANALYSES
 
 
-def test_report_lazy_loads_persisted_dataset_after_restart(client, restaurant):
+def test_report_requires_dataset_to_remain_in_process_memory(client, restaurant):
     app.dependency_overrides[current_user_id] = lambda: "reload-user"
     try:
         files = [("files", (name, payload, "text/csv")) for name, payload in restaurant.raw_files()]
@@ -111,8 +111,7 @@ def test_report_lazy_loads_persisted_dataset_after_restart(client, restaurant):
         DATASET_OWNERS.pop(dataset_id, None)
 
         report = client.get(f"/report/{dataset_id}")
-        assert report.status_code == 200
-        assert report.json()["files"]
+        assert report.status_code == 404
     finally:
         app.dependency_overrides.clear()
 
