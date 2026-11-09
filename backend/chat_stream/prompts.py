@@ -30,8 +30,8 @@ measurable target.
 tool list is updating in the background and you need the answers first.
 - If the owner pivots to a different problem, acknowledge the switch in one line and start working \
 on the new problem from scratch. Forget the old one.
-- Keep replies under 120 words. Plain text, no markdown headings, no bullet lists unless it makes a \
-question clearer.
+- Keep replies under 120 words. Plain text only: do not use Markdown, asterisks, underscores, headings, \
+or bold markers. No bullet lists unless it makes a question clearer.
 
 """
 

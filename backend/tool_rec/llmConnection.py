@@ -180,6 +180,7 @@ Rules:
 - `tool_tagline` is one punchy sentence (under ~25 words) — quick UI intro; not redundant with the name.
 - `tool_description` is the full narrative (what it does, how it solves the problem, integrations,
   ROI, reliability, adoptability).
+- All text fields must be plain text. Do not use Markdown or wrap names/phrases in `**` or `_` markers.
 - `solution_tags` is 1–3 ids from exactly: {", ".join(SOLUTION_TAGS)} — what the product is for, e.g.
   Toast → `pos` + `payments`; QuickBooks → `accounting`; an AI menu writer → `ai_llm` + `marketing`.
   Pick tags that match how a restaurant owner would bucket the tool (POS solution, accounting solution, etc.).
