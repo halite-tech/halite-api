@@ -6,7 +6,7 @@ services:
     startCommand: uvicorn backend.api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     envVars:
-      - key: FRONTEND_ORIGINS
+      - key: FRONTEND_URL
         sync: false
       - key: CLERK_JWKS_URL
         sync: false

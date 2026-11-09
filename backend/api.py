@@ -73,7 +73,7 @@ def _sse_chunk(evt: dict) -> str:
 
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
-configured_origins = os.getenv("FRONTEND_ORIGINS", "")
+configured_origins = os.getenv("FRONTEND_URL", os.getenv("FRONTEND_ORIGINS", ""))
 frontend_origins = [
     origin.strip().rstrip("/")
     for origin in configured_origins.split(",")
