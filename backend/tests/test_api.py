@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.api import app
+from backend.auth import current_user_id
 
 
 @pytest.fixture(scope="module")
@@ -40,7 +41,7 @@ def test_upload_analyze_report_flow(client, restaurant):
     assert one.json()["name"] == "Test"
     assert "sales" in one.json()["domains"]
 
-    assert client.get(f"/report/{dataset_id}").status_code == 409
+    assert client.get(f"/report/{dataset_id}").status_code == 200
     analyzed = client.post(f"/analyze/{dataset_id}")
     assert analyzed.status_code == 200
     report = client.get(f"/report/{dataset_id}?alpha=0.3")
@@ -66,6 +67,24 @@ def test_unknown_dataset_is_404(client):
     assert client.get("/datasets/nope").status_code == 404
 
 
+def test_datasets_are_scoped_to_the_authenticated_user(client, restaurant):
+    app.dependency_overrides[current_user_id] = lambda: "business-a"
+    try:
+        uploaded = client.post(
+            "/uploads",
+            files=[("files", (name, payload, "text/csv")) for name, payload in restaurant.raw_files()],
+        )
+        assert uploaded.status_code == 200
+        dataset_id = uploaded.json()["dataset_id"]
+
+        app.dependency_overrides[current_user_id] = lambda: "business-b"
+        assert all(item["dataset_id"] == "demo" for item in client.get("/datasets").json()["datasets"])
+        assert client.get(f"/datasets/{dataset_id}").status_code == 404
+        assert client.post(f"/analyze/{dataset_id}").status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_chat_session_rebuilds_analysis_after_restart(client, restaurant):
     files = [("files", (name, payload, "text/csv")) for name, payload in restaurant.raw_files()]
     up = client.post("/uploads", files=files, data={"profile": json.dumps({"name": "Chat Reload"})})
@@ -79,6 +98,25 @@ def test_chat_session_rebuilds_analysis_after_restart(client, restaurant):
     assert dataset_id in ANALYSES
 
 
+def test_report_lazy_loads_persisted_dataset_after_restart(client, restaurant):
+    app.dependency_overrides[current_user_id] = lambda: "reload-user"
+    try:
+        files = [("files", (name, payload, "text/csv")) for name, payload in restaurant.raw_files()]
+        up = client.post("/uploads", files=files)
+        assert up.status_code == 200
+        dataset_id = up.json()["dataset_id"]
+        from backend.api import ANALYSES, DATASETS, DATASET_OWNERS
+        ANALYSES.pop(dataset_id, None)
+        DATASETS.pop(dataset_id, None)
+        DATASET_OWNERS.pop(dataset_id, None)
+
+        report = client.get(f"/report/{dataset_id}")
+        assert report.status_code == 200
+        assert report.json()["files"]
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_bulk_delete_files(client):
     files = [
         ("files", ("sales.csv", b"Order #,Order Time,Net Sales\n1,2026-01-01,10\n", "text/csv")),
@@ -90,6 +128,31 @@ def test_bulk_delete_files(client):
     deleted = client.request("DELETE", f"/datasets/{dataset_id}/files/bulk", json=["sales.csv", "cash_drawer.csv"])
     assert deleted.status_code == 200
     assert deleted.json()["files"] == []
+
+
+def test_context_deduplicates_files_across_legacy_user_records(client, restaurant):
+    app.dependency_overrides[current_user_id] = lambda: "dedupe-user"
+    try:
+        files = [("files", (name, payload, "text/csv")) for name, payload in restaurant.raw_files()]
+        first = client.post("/uploads", files=files)
+        assert first.status_code == 200
+        second = client.post("/uploads", files=files[:1])
+        assert second.status_code == 200
+
+        context = client.get("/context")
+        assert context.status_code == 200
+        filenames = [file["filename"] for file in context.json()["files"]]
+        assert len(filenames) == len(set(filenames)) == len(restaurant.raw_files())
+        assert all(file["last_modified"] > 0 for file in context.json()["files"])
+        assert all("payload" not in file for file in context.json()["files"])
+        deleted = client.request("DELETE", "/context/files", json=filenames)
+        assert deleted.status_code == 200
+        assert deleted.json()["files"] == []
+        repeated = client.request("DELETE", "/context/files", json=filenames)
+        assert repeated.status_code == 200
+        assert repeated.json()["files"] == []
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_taxonomy_lists_categories_with_tool_tags(client):

@@ -25,6 +25,7 @@ class ToolsState:
 
 @dataclass
 class ChatSession:
+    owner_id: str = "local"
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     created_at: float = field(default_factory=time.time)
     context: str | None = None  # optional background (e.g. the restaurant's analysed report)
@@ -32,8 +33,6 @@ class ChatSession:
     # --- the one problem currently in focus ---
     problem: str | None = None
     problem_version: int = 0  # bumps every time the focus is replaced
-    understood: bool = False
-    clarity: int = 0
     known_facts: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
     focus_user_turns: int = 0  # owner answers given on the current problem
@@ -58,8 +57,6 @@ class ChatSession:
         return {
             "problem": self.problem,
             "problem_version": self.problem_version,
-            "understood": self.understood,
-            "clarity": self.clarity,
             "known_facts": self.known_facts,
             "open_questions": self.open_questions,
         }
@@ -72,8 +69,8 @@ class ChatSession:
 SESSIONS: dict[str, ChatSession] = {}
 
 
-def create_session(context: str | None = None) -> ChatSession:
-    session = ChatSession(context=context)
+def create_session(context: str | None = None, owner_id: str = "local") -> ChatSession:
+    session = ChatSession(context=context, owner_id=owner_id)
     SESSIONS[session.id] = session
     return session
 

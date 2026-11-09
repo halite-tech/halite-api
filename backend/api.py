@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.chat_stream import session as chat_sessions
+from backend.auth import current_user_id
 from backend.chat_stream.openrouter import OpenRouterError, api_key
 from backend.chat_stream.service import problem_brief, run_turn
 from backend.ingest.dataset import Dataset, Profile
@@ -28,7 +29,7 @@ from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
 from backend.shared.debug import debug, debug_trim
-from backend.storage import create_dataset, delete_file, delete_files, load_datasets, load_files, replace_files
+from backend.storage import create_dataset, delete_file, delete_files, delete_user_files, load_dataset, load_datasets, load_files, load_user_file_metadata, load_user_files, replace_files, upsert_user_files
 from backend.tool_rec.llmConnection import get_tools
 
 def _patch_uvicorn_keep_alive(seconds: int = 300) -> None:
@@ -80,10 +81,8 @@ app.add_middleware(
 
 # In-memory store; fine for a prototype, swap for a database in production.
 DATASETS: dict[str, Dataset] = {}
+DATASET_OWNERS: dict[str, str] = {}
 ANALYSES: dict[str, Analysis] = {}
-
-for _dataset_id, _profile, _files in load_datasets():
-    DATASETS[_dataset_id] = build_dataset(_files, Profile.from_dict(_profile))
 
 Alpha = Query(DEFAULT_ALPHA, ge=0.0, le=1.0, description="1.0 = rank by money only, 0.0 = by time only")
 
@@ -118,27 +117,178 @@ def _dataset_summary(dataset_id: str, ds: Dataset) -> dict:
     }
 
 
+def _owned_dataset(dataset_id: str, user_id: str) -> Dataset:
+    ds = DATASETS.get(dataset_id)
+    if ds is None:
+        persisted = load_dataset(user_id, dataset_id)
+        if persisted is not None:
+            profile, files = persisted
+            ds = build_dataset(files, Profile.from_dict(profile))
+            DATASETS[dataset_id] = ds
+            DATASET_OWNERS[dataset_id] = user_id
+    if ds is None or DATASET_OWNERS.get(dataset_id) != user_id:
+        raise HTTPException(404, "unknown dataset_id")
+    return ds
+
+
+def _user_dataset(user_id: str) -> Dataset:
+    profile, files = load_user_files(user_id)
+    if not files:
+        raise HTTPException(404, "no files uploaded")
+    ds = build_dataset(files, Profile.from_dict(profile or None))
+    DATASETS[user_id] = ds
+    DATASET_OWNERS[user_id] = user_id
+    return ds
+
+
+def _user_report(user_id: str, alpha: float) -> dict:
+    ds = _user_dataset(user_id)
+    ANALYSES[user_id] = analyze(ds)
+    return build_report(ANALYSES[user_id], alpha)
+
+
+def _user_file_summary(user_id: str) -> dict:
+    profile, files = load_user_file_metadata(user_id)
+    return {
+        "dataset_id": "context",
+        "name": profile.get("name", "Business context"),
+        "files": [
+            {"name": filename, "filename": filename, "size": size, "last_modified": uploaded_at}
+            for filename, size, uploaded_at in files
+        ],
+        "profile": profile,
+    }
+
+
+@app.get("/context")
+def get_context(user_id: str = Depends(current_user_id)):
+    return _user_file_summary(user_id)
+
+
+@app.post("/context/files")
+async def upload_context(
+    files: list[UploadFile] = File(...),
+    profile: str | None = Form(None),
+    user_id: str = Depends(current_user_id),
+):
+    try:
+        profile_data = json.loads(profile) if profile else {}
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise HTTPException(400, f"profile must be a JSON object: {exc}")
+    raw = [(f.filename or "upload.csv", await f.read()) for f in files]
+    upsert_user_files(user_id, profile_data, raw)
+    ANALYSES.pop(user_id, None)
+    return _user_file_summary(user_id)
+
+
+@app.delete("/context/files")
+def delete_context_files(filenames: list[str], user_id: str = Depends(current_user_id)):
+    if not filenames:
+        raise HTTPException(400, "filenames must contain at least one filename")
+    _, files = load_user_file_metadata(user_id)
+    known = {filename for filename, _, _ in files}
+    delete_user_files(user_id, [filename for filename in filenames if filename in known])
+    DATASETS.pop(user_id, None)
+    ANALYSES.pop(user_id, None)
+    return _user_file_summary(user_id)
+
+
+@app.post("/context/analyze")
+def analyze_context(alpha: float = Alpha, user_id: str = Depends(current_user_id)):
+    return _user_report(user_id, alpha)
+
+
+@app.post("/context/report")
+async def context_report(
+    files: list[UploadFile] = File(...),
+    alpha: float = Form(DEFAULT_ALPHA),
+):
+    raw = [(f.filename or "upload.csv", await f.read()) for f in files]
+    if not raw:
+        raise HTTPException(422, "at least one context file is required")
+    dataset = build_dataset(raw)
+    if not dataset.tables:
+        raise HTTPException(422, "none of the context files matched a known data type")
+    return build_report(analyze(dataset), alpha)
+
+
+@app.get("/context/tools")
+def context_tools(alpha: float = Alpha, user_id: str = Depends(current_user_id)):
+    report = _user_report(user_id, alpha)
+    problems = _problem_briefs_for_tools(report)
+    if not problems:
+        raise HTTPException(422, "no confident top problems to research")
+    return get_tools(problems)
+
+
+@app.post("/context/tools/stream")
+async def context_tools_stream(
+    files: list[UploadFile] = File(...),
+    alpha: float = Form(DEFAULT_ALPHA),
+    problem: str | None = Form(None),
+):
+    raw = [(f.filename or "upload.csv", await f.read()) for f in files]
+    dataset = build_dataset(raw)
+    if not dataset.tables:
+        raise HTTPException(422, "none of the context files matched a known data type")
+    report = build_report(analyze(dataset), alpha)
+    problems = _problem_briefs_for_tools(report, problem)
+    if not problems:
+        raise HTTPException(422, "no confident top problems to research")
+
+    async def events():
+        def chunk(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+        updates = (
+            ("preparing", "Reading your top business problems…", 10),
+            ("researching", "Searching vendor sites and product capabilities…", 35),
+            ("pricing", "Checking pricing, integrations, and restaurant fit…", 60),
+            ("ranking", "Comparing the strongest options…", 82),
+        )
+        yield chunk("progress", {"phase": updates[0][0], "message": updates[0][1], "progress": updates[0][2]})
+        task = asyncio.create_task(asyncio.to_thread(get_tools, problems))
+        index = 1
+        while not task.done():
+            await asyncio.sleep(2)
+            if task.done():
+                break
+            phase, message, progress = updates[index % len(updates)]
+            index += 1
+            yield chunk("progress", {"phase": phase, "message": message, "progress": progress})
+        try:
+            result = await task
+        except Exception as exc:
+            yield chunk("error", {"message": f"Error getting tools: {exc}"})
+            return
+        yield chunk("progress", {"phase": "complete", "message": "Recommendations ready.", "progress": 100})
+        yield chunk("done", result)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
 @app.get("/datasets")
-def list_datasets():
-    """List every durably stored upload, plus whether analyze has run.
+def list_datasets(user_id: str = Depends(current_user_id)):
+    """List the current user's durably stored uploads, plus whether analyze has run.
 
     Uploaded files and profiles are restored from SQLite when the server starts. Analysis
     results remain in memory and are rebuilt on demand after a restart. `demo` is listed
     only after `/demo` (or tools/chat with dataset_id=demo) has built the synthetic analysis.
     """
-    items = [_dataset_summary(i, ds) for i, ds in DATASETS.items()]
+    if not DATASETS:
+        for dataset_id, owner_id, profile, files in load_datasets():
+            DATASETS[dataset_id] = build_dataset(files, Profile.from_dict(profile))
+            DATASET_OWNERS[dataset_id] = owner_id
+    items = [_dataset_summary(i, ds) for i, ds in DATASETS.items() if DATASET_OWNERS.get(i) == user_id]
     if _demo_analysis.cache_info().currsize:
         items.append(_dataset_summary("demo", _demo_analysis().dataset))
     return {"datasets": items}
 
 
 @app.get("/datasets/{dataset_id}")
-def get_dataset(dataset_id: str):
+def get_dataset(dataset_id: str, user_id: str = Depends(current_user_id)):
     if dataset_id == "demo":
         return _dataset_summary("demo", _demo_analysis().dataset)
-    ds = DATASETS.get(dataset_id)
-    if ds is None:
-        raise HTTPException(404, "unknown dataset_id")
+    ds = _owned_dataset(dataset_id, user_id)
     return _dataset_summary(dataset_id, ds)
 
 
@@ -147,6 +297,7 @@ async def upload(
     files: list[UploadFile] = File(...),
     profile: str | None = Form(None),
     dataset_id: str | None = Form(None),
+    user_id: str = Depends(current_user_id),
 ):
     try:
         prof = Profile.from_dict(json.loads(profile) if profile else None)
@@ -159,16 +310,15 @@ async def upload(
                                   "files": [r.to_dict() for r in incoming.files]})
 
     if dataset_id:
-        ds = DATASETS.get(dataset_id)
-        if ds is None:
-            raise HTTPException(404, "unknown dataset_id")
-        replace_files(dataset_id, raw)
-        DATASETS[dataset_id] = build_dataset(load_files(dataset_id), ds.profile)
+        ds = _owned_dataset(dataset_id, user_id)
+        replace_files(user_id, dataset_id, raw)
+        DATASETS[dataset_id] = build_dataset(load_files(user_id, dataset_id), ds.profile)
         ANALYSES.pop(dataset_id, None)
     else:
         dataset_id = uuid.uuid4().hex[:12]
-        create_dataset(dataset_id, (prof or incoming.profile).to_dict(), raw)
+        create_dataset(user_id, dataset_id, (prof or incoming.profile).to_dict(), raw)
         DATASETS[dataset_id] = build_dataset(raw, prof)
+        DATASET_OWNERS[dataset_id] = user_id
     ds = DATASETS[dataset_id]
     return {
         "dataset_id": dataset_id,
@@ -179,28 +329,24 @@ async def upload(
 
 
 @app.delete("/datasets/{dataset_id}/files")
-def delete_dataset_file(dataset_id: str, filename: str = Query(..., min_length=1)):
-    ds = DATASETS.get(dataset_id)
-    if ds is None:
-        raise HTTPException(404, "unknown dataset_id")
+def delete_dataset_file(dataset_id: str, filename: str = Query(..., min_length=1), user_id: str = Depends(current_user_id)):
+    ds = _owned_dataset(dataset_id, user_id)
 
     report_index = next((i for i, report in enumerate(ds.files) if report.filename == filename), None)
     if report_index is None:
         raise HTTPException(404, "unknown file")
 
-    if not delete_file(dataset_id, filename):
+    if not delete_file(user_id, dataset_id, filename):
         raise HTTPException(404, "unknown file")
     profile = ds.profile
-    DATASETS[dataset_id] = build_dataset(load_files(dataset_id), profile)
+    DATASETS[dataset_id] = build_dataset(load_files(user_id, dataset_id), profile)
     ANALYSES.pop(dataset_id, None)
     return _dataset_summary(dataset_id, ds)
 
 
 @app.delete("/datasets/{dataset_id}/files/bulk")
-def delete_dataset_files(dataset_id: str, filenames: list[str]):
-    ds = DATASETS.get(dataset_id)
-    if ds is None:
-        raise HTTPException(404, "unknown dataset_id")
+def delete_dataset_files(dataset_id: str, filenames: list[str], user_id: str = Depends(current_user_id)):
+    ds = _owned_dataset(dataset_id, user_id)
     requested = list(dict.fromkeys(filename for filename in filenames if filename.strip()))
     if not requested:
         raise HTTPException(400, "filenames must contain at least one filename")
@@ -208,23 +354,25 @@ def delete_dataset_files(dataset_id: str, filenames: list[str]):
     unknown = [filename for filename in requested if filename not in known]
     if unknown:
         raise HTTPException(404, f"unknown file: {unknown[0]}")
-    delete_files(dataset_id, requested)
-    DATASETS[dataset_id] = build_dataset(load_files(dataset_id), ds.profile)
+    delete_files(user_id, dataset_id, requested)
+    DATASETS[dataset_id] = build_dataset(load_files(user_id, dataset_id), ds.profile)
     ANALYSES.pop(dataset_id, None)
     return _dataset_summary(dataset_id, DATASETS[dataset_id])
 
 
 @app.post("/analyze/{dataset_id}")
-def run_analysis(dataset_id: str, alpha: float = Alpha):
-    ds = DATASETS.get(dataset_id)
-    if ds is None:
-        raise HTTPException(404, "unknown dataset_id")
+def run_analysis(dataset_id: str, alpha: float = Alpha, user_id: str = Depends(current_user_id)):
+    ds = _owned_dataset(dataset_id, user_id)
     ANALYSES[dataset_id] = analyze(ds)
     return build_report(ANALYSES[dataset_id], alpha)
 
 
 @app.get("/report/{dataset_id}")
-def report(dataset_id: str, alpha: float = Alpha):
+def report(dataset_id: str, alpha: float = Alpha, user_id: str = Depends(current_user_id)):
+    if dataset_id != "demo":
+        _owned_dataset(dataset_id, user_id)
+        if dataset_id not in ANALYSES:
+            ANALYSES[dataset_id] = analyze(DATASETS[dataset_id])
     if dataset_id not in ANALYSES:
         if dataset_id in DATASETS:
             raise HTTPException(409, "dataset not analyzed yet; POST /analyze/{dataset_id} first")
@@ -245,12 +393,12 @@ def demo(alpha: float = Alpha):
     return demo_report
 
 
-def _analysis_for_dataset(dataset_id: str) -> Analysis:
+def _analysis_for_dataset(dataset_id: str, user_id: str | None = None) -> Analysis:
     if dataset_id == "demo":
         return _demo_analysis()
-    if dataset_id in ANALYSES:
+    if dataset_id in ANALYSES and (user_id is None or DATASET_OWNERS.get(dataset_id) == user_id):
         return ANALYSES[dataset_id]
-    if dataset_id in DATASETS:
+    if dataset_id in DATASETS and (user_id is None or DATASET_OWNERS.get(dataset_id) == user_id):
         raise HTTPException(409, "dataset not analyzed yet; POST /analyze/{dataset_id} first")
     raise HTTPException(404, "unknown dataset_id")
 
@@ -297,7 +445,9 @@ def _tool_recommendations(dataset_id: str, alpha: float, *, log_label: str) -> d
 def tools(
     dataset_id: str = Query(..., description="Analyzed upload id, or 'demo' for synthetic data"),
     alpha: float = Alpha,
+    user_id: str = Depends(current_user_id),
 ):
+    _owned_dataset(dataset_id, user_id)
     return _tool_recommendations(dataset_id, alpha, log_label="GET /tools")
 
 
@@ -306,9 +456,10 @@ async def stream_tools(
     dataset_id: str = Query(..., description="Analyzed upload id, or 'demo' for synthetic data"),
     alpha: float = Alpha,
     problem: str | None = Query(None, description="Optional problem label/category to research"),
+    user_id: str = Depends(current_user_id),
 ):
     """Stream progress while researching tools for an analyzed dataset."""
-    report = build_report(_analysis_for_dataset(dataset_id), alpha)
+    report = build_report(_analysis_for_dataset(dataset_id, user_id), alpha)
     problems = _problem_briefs_for_tools(report, problem)
     if not problems:
         raise HTTPException(422, "no confident top problems to research; POST /analyze after upload")
@@ -364,31 +515,36 @@ class ChatMessageIn(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
 
 
-def _chat_context(dataset_id: str | None) -> str | None:
+def _chat_context(dataset_id: str | None, user_id: str) -> str | None:
     if not dataset_id:
-        return None
+        if not load_user_files(user_id)[1]:
+            return None
+        analysis = analyze(_user_dataset(user_id))
+        rep = build_report(analysis)
+        return "\n".join([f"Restaurant: {rep['restaurant']['name']}"] + [f"- {p['summary']}" for p in rep["top_problems"]])
     if dataset_id != "demo" and dataset_id not in ANALYSES and dataset_id in DATASETS:
+        _owned_dataset(dataset_id, user_id)
         # Uploaded files survive restarts; rebuild the in-memory analysis before chat
         # session creation so the app and chat panel can reload in parallel safely.
         ANALYSES[dataset_id] = analyze(DATASETS[dataset_id])
-    analysis = _analysis_for_dataset(dataset_id)
+    analysis = _analysis_for_dataset(dataset_id, user_id)
     rep = build_report(analysis)
     lines = [f"Restaurant: {rep['restaurant']['name']}"]
     lines += [f"- {p['summary']}" for p in rep["top_problems"]]
     return "\n".join(lines)
 
 
-def _chat_session_or_404(session_id: str) -> chat_sessions.ChatSession:
+def _chat_session_or_404(session_id: str, user_id: str) -> chat_sessions.ChatSession:
     session = chat_sessions.get_session(session_id)
-    if session is None:
+    if session is None or session.owner_id != user_id:
         raise HTTPException(404, "unknown session_id")
     return session
 
 
 @app.post("/chat/sessions")
-def create_chat_session(body: ChatSessionIn | None = None):
-    dataset_id = body.dataset_id if body else None
-    session = chat_sessions.create_session(_chat_context(dataset_id))
+def create_chat_session(body: ChatSessionIn | None = None, user_id: str = Depends(current_user_id)):
+    dataset_id = body.dataset_id if body and body.dataset_id else None
+    session = chat_sessions.create_session(_chat_context(dataset_id, user_id), owner_id=user_id)
     debug(
         "api/chat",
         f"POST /chat/sessions -> session_id={session.id} dataset_id={dataset_id!r} "
@@ -398,9 +554,9 @@ def create_chat_session(body: ChatSessionIn | None = None):
 
 
 @app.get("/chat/sessions/{session_id}")
-def get_chat_session(session_id: str):
-    """Full transcript, current problem/clarity, and the latest tool recommendations (poll this)."""
-    session = _chat_session_or_404(session_id)
+def get_chat_session(session_id: str, user_id: str = Depends(current_user_id)):
+    """Full transcript, current problem, and the latest tool recommendations (poll this)."""
+    session = _chat_session_or_404(session_id, user_id)
     t = session.tools
     if t.status in ("ready", "error"):
         recs = (t.result or {}).get("recommendations", []) if isinstance(t.result, dict) else []
@@ -415,20 +571,21 @@ def get_chat_session(session_id: str):
 
 
 @app.delete("/chat/sessions/{session_id}")
-def delete_chat_session(session_id: str):
+def delete_chat_session(session_id: str, user_id: str = Depends(current_user_id)):
+    _chat_session_or_404(session_id, user_id)
     if not chat_sessions.delete_session(session_id):
         raise HTTPException(404, "unknown session_id")
     return {"ok": True}
 
 
 @app.post("/chat/sessions/{session_id}/messages")
-async def chat_message(session_id: str, body: ChatMessageIn):
+async def chat_message(session_id: str, body: ChatMessageIn, user_id: str = Depends(current_user_id)):
     """Send an owner message; replies as a server-sent-event stream.
 
     Events: status (thinking / researching / aggregating), state, tools, notice,
     token*, done | error. Always streamed so the UI can show a thinking ticker immediately.
     """
-    session = _chat_session_or_404(session_id)
+    session = _chat_session_or_404(session_id, user_id)
     try:
         api_key()
     except OpenRouterError as exc:

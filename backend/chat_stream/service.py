@@ -1,13 +1,10 @@
 """One chat turn: track the problem in focus, kick off tool research, stream the grilling reply.
 
 Per user message:
-  1. A structured (non-streaming) call decides whether the owner kept, refined, or replaced the
-     problem and scores how well it is understood so far.
+  1. A structured (non-streaming) call re-finds the current problem from the conversation.
   2. If the problem was replaced, the old problem and its working context are dropped and the new
-     one takes its place. Tool research (`get_tools`) runs only after enough context: the extractor
-     marks the problem understood, or the owner has sent ``MAX_OWNER_TURNS_BEFORE_TOOLS`` messages
-     on the current problem (whichever comes first).
-  3. The grilling reply is streamed token by token.
+     one takes its place.
+  3. Tool research and the grilling reply are streamed independently of a clarity threshold.
 """
 from __future__ import annotations
 
@@ -23,9 +20,6 @@ from backend.chat_stream.session import ChatSession, ToolsState
 from backend.shared.debug import debug, debug_trim
 from backend.tool_rec.llmConnection import get_tools
 
-MIN_ROUNDS = 3  # owner answers required on a problem before it can count as understood
-MAX_OWNER_TURNS_BEFORE_TOOLS = 3  # else launch tools with whatever context was collected
-UNDERSTOOD_CLARITY = 85
 LOOKING_FOR_TOOLS_MSG = "Looking for tools…"
 STATUS_THINKING = ("thinking", "Thinking about your answer…")
 STATUS_COMPOSING = ("composing", "Writing a follow-up…")
@@ -56,14 +50,10 @@ def _system_prompt(session: ChatSession, switched: bool) -> str:
                      "questions, but make the owner confirm anything you rely on):\n" + session.context)
     facts = "\n".join(f"- {f}" for f in session.known_facts) or "- (nothing yet)"
     questions = "\n".join(f"- {q}" for q in session.open_questions) or "- (none)"
-    status = ("UNDERSTOOD: stop grilling and wrap up as instructed." if session.understood
-              else "NOT YET UNDERSTOOD: keep grilling.")
     parts.append(
         "SESSION STATE\n"
         f"Problem in focus: {session.problem}\n"
         f"Owner answers on this problem so far: {session.focus_user_turns}\n"
-        f"Clarity: {session.clarity}/100\n"
-        f"Status: {status}\n"
         f"Known facts:\n{facts}\n"
         f"Open questions (grill these next):\n{questions}"
         + ("\nThe owner JUST SWITCHED to this problem. Acknowledge the switch in one line and start fresh."
@@ -130,14 +120,8 @@ async def _tools_job(session: ChatSession, run: int, brief: str) -> None:
         )
 
 
-def _context_ready_for_tools(session: ChatSession) -> bool:
-    return session.understood or session.focus_user_turns >= MAX_OWNER_TURNS_BEFORE_TOOLS
-
-
 def _should_launch_tools(session: ChatSession) -> bool:
     if not (session.problem or "").strip():
-        return False
-    if not _context_ready_for_tools(session):
         return False
     brief = problem_brief(session)
     t = session.tools
@@ -153,7 +137,7 @@ def launch_tools(session: ChatSession) -> asyncio.Task[None]:
     debug(
         "chat",
         f"session={session.id} launch_tools run={session.tools_run} "
-        f"v={session.problem_version} understood={session.understood} clarity={session.clarity}",
+        f"v={session.problem_version}",
     )
     task = asyncio.create_task(_tools_job(session, session.tools_run, brief))
     _BACKGROUND.add(task)
@@ -179,14 +163,6 @@ def _apply_analysis(session: ChatSession, analysis: dict, user_message: str) -> 
     action = analysis["action"] if previous else "new_problem"
     statement = (analysis["problem"] or "").strip()
     facts = [str(f) for f in analysis["known_facts"]]
-    if previous and action == "new_problem" and not analysis.get("explicit_switch"):
-        # The extractor tends to mistake background answers ("60 seats, we use Toast") for a new
-        # problem. That would wipe the context and reset the turn counter, so the chat would never
-        # reach the tools step. Only an explicit switch may replace the problem.
-        debug("chat", f"session={session.id} ignoring new_problem without explicit_switch -> refine")
-        action = "refine"
-        statement = previous
-        facts = list(dict.fromkeys([*session.known_facts, *facts]))
     if action == "keep" or not statement:
         statement = previous or user_message.strip()[:300]
     changed = statement != previous
@@ -204,11 +180,6 @@ def _apply_analysis(session: ChatSession, analysis: dict, user_message: str) -> 
     session.focus_user_turns += 1
     session.log("user", user_message, problem_version=session.problem_version)
 
-    clarity = max(0, min(100, int(analysis["clarity"])))
-    ready = (bool(analysis["understood"]) and clarity >= UNDERSTOOD_CLARITY
-             and session.focus_user_turns >= MIN_ROUNDS)
-    session.clarity = clarity if ready else min(clarity, UNDERSTOOD_CLARITY - 1)
-    session.understood = ready
     session.known_facts = facts
     session.open_questions = [str(q) for q in analysis["open_questions"]]
     return action, previous, changed
@@ -225,7 +196,6 @@ def _status(phase: str, message: str) -> dict:
 
 async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dict]:
     """Yield {"event", "data"} dicts: status, state, tools, notice, token*, done (or error)."""
-    was_understood = session.understood
     debug_trim("chat", f"session={session.id} turn IN: {user_message!r}", 120)
     yield _status(*STATUS_THINKING)
     try:
@@ -238,7 +208,6 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
     debug(
         "chat",
         f"session={session.id} extractor action={analysis.get('action')} "
-        f"clarity={analysis.get('clarity')} understood={analysis.get('understood')} "
         f"facts={len(analysis.get('known_facts') or [])} open_q={len(analysis.get('open_questions') or [])}",
     )
     debug_trim("chat", f"problem statement: {analysis.get('problem', '')}", 200)
@@ -248,13 +217,9 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
     debug(
         "chat",
         f"session={session.id} applied action={action} switched={switched} changed={changed} "
-        f"turns={session.focus_user_turns} understood={session.understood} (was {was_understood})",
+        f"turns={session.focus_user_turns}",
     )
     launch_tools_now = _should_launch_tools(session)
-    if launch_tools_now:
-        # Context is complete enough for tooling — full clarity in the UI and wrap-up grilling.
-        session.clarity = 100
-        session.understood = True
 
     yield _event("state", {**session.state(), "action": action, "previous_problem": previous})
 
@@ -263,10 +228,9 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
     messages += session.focus_messages[-MAX_CONTEXT_MESSAGES:]
 
     if launch_tools_now:
-        reason = "understood" if was_understood or analysis.get("understood") else f">={MAX_OWNER_TURNS_BEFORE_TOOLS}_turns"
         debug(
             "chat",
-            f"session={session.id} launch_tools reason={reason} turns={session.focus_user_turns} clarity=100",
+            f"session={session.id} launch_tools turns={session.focus_user_turns}",
         )
         tools_task = launch_tools(session)
         yield _event("tools", _tools_status(session))
@@ -290,8 +254,7 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
         debug(
             "chat",
             f"session={session.id} skip launch_tools "
-            f"turns={session.focus_user_turns}/{MAX_OWNER_TURNS_BEFORE_TOOLS} "
-            f"understood={session.understood} tools={session.tools.status}",
+            f"turns={session.focus_user_turns} tools={session.tools.status}",
         )
 
     if not launch_tools_now:
