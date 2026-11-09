@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import uuid
 from functools import lru_cache
@@ -72,9 +73,19 @@ def _sse_chunk(evt: dict) -> str:
 
 
 app = FastAPI(title="AISB Restaurant Problem Engines", version="0.1.0")
+configured_origins = os.getenv("FRONTEND_ORIGINS", "")
+frontend_origins = [
+    origin.strip().rstrip("/")
+    for origin in configured_origins.split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        *frontend_origins,
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )
