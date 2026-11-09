@@ -1,10 +1,10 @@
-"""One chat turn: track the problem in focus, kick off tool research, stream the grilling reply.
+"""One chat turn: track the problem in focus and stream the grilling reply.
 
 Per user message:
   1. A structured (non-streaming) call re-finds the current problem from the conversation.
   2. If the problem was replaced, the old problem and its working context are dropped and the new
      one takes its place.
-  3. Tool research and the grilling reply are streamed independently of a clarity threshold.
+  3. Tool research is opt-in through the dashboard; chat only updates the problem state.
 """
 from __future__ import annotations
 
@@ -219,46 +219,13 @@ async def run_turn(session: ChatSession, user_message: str) -> AsyncIterator[dic
         f"session={session.id} applied action={action} switched={switched} changed={changed} "
         f"turns={session.focus_user_turns}",
     )
-    launch_tools_now = _should_launch_tools(session)
-
     yield _event("state", {**session.state(), "action": action, "previous_problem": previous})
 
     parts: list[str] = []
     messages = [{"role": "system", "content": _system_prompt(session, switched)}]
     messages += session.focus_messages[-MAX_CONTEXT_MESSAGES:]
 
-    if launch_tools_now:
-        debug(
-            "chat",
-            f"session={session.id} launch_tools turns={session.focus_user_turns}",
-        )
-        tools_task = launch_tools(session)
-        yield _event("tools", _tools_status(session))
-        session.log("assistant", LOOKING_FOR_TOOLS_MSG, problem_version=session.problem_version)
-        yield _event("notice", {"text": LOOKING_FOR_TOOLS_MSG})
-        yield _status(*RESEARCH_TICKS[0])
-        tick = 1
-        while not tools_task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(tools_task), timeout=8)
-            except asyncio.TimeoutError:
-                phase, message = RESEARCH_TICKS[tick % len(RESEARCH_TICKS)]
-                tick += 1
-                yield _status(phase, message)
-            except Exception as exc:  # noqa: BLE001
-                debug("chat", f"session={session.id} tools task failed: {exc}")
-                break
-        yield _event("tools", _tools_status(session))
-        yield _status("aggregating", "Recommendations ready — writing a follow-up…")
-    else:
-        debug(
-            "chat",
-            f"session={session.id} skip launch_tools "
-            f"turns={session.focus_user_turns} tools={session.tools.status}",
-        )
-
-    if not launch_tools_now:
-        yield _status(*STATUS_COMPOSING)
+    yield _status(*STATUS_COMPOSING)
     try:
         async for delta in stream_chat(messages):
             parts.append(delta)

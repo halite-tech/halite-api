@@ -77,7 +77,7 @@ def send(client, sid, msg):
     return parse_sse(r.text)
 
 
-def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
+def test_problem_switch_replaces_problem_without_running_tools(fake_llm):
     script, tool_calls, seen_prompts = fake_llm
     with TestClient(app) as client:
         sid = client.post("/chat/sessions").json()["session_id"]
@@ -87,22 +87,17 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         names = [e for e, _ in events]
         assert names[0] == "status" and events[0][1]["phase"] == "thinking"
         assert "state" in names and names[-1] == "done"
-        assert "tools" in names
+        assert "tools" not in names
         assert first_state(events)["problem"] == "Food waste is high"
-        assert len(tool_calls) == 1
+        assert len(tool_calls) == 0
 
         script.append(analysis("keep", "Food waste is high", facts=["waste bin full nightly", "200 lbs/wk"]))
         events = send(client, sid, "about 200 lbs a week")
         names = [e for e, _ in events]
-        assert "tools" in names and "notice" in names
+        assert "tools" not in names and "notice" not in names
         assert "clarity" not in first_state(events)
         assert "understood" not in first_state(events)
-        assert any(d.get("text") == service.LOOKING_FOR_TOOLS_MSG for e, d in events if e == "notice")
-        assert names.index("notice") < names.index("token")
-        wait_for_tools(client, sid)
-        assert len(tool_calls) == 2
-        assert "Food waste is high" in tool_calls[-1][0]
-        assert "200 lbs/wk" in tool_calls[-1][0]
+        assert len(tool_calls) == 0
 
         script.append(analysis("new_problem", "Servers no-show constantly", facts=["3 no-shows a month"]))
         events = send(client, sid, "actually forget that, my real problem is no-shows")
@@ -111,7 +106,7 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         assert state["previous_problem"] == "Food waste is high"
         assert state["problem"] == "Servers no-show constantly"
         assert state["known_facts"] == ["3 no-shows a month"]
-        assert "tools" in [e for e, _ in events]
+        assert "tools" not in [e for e, _ in events]
 
         # the model only sees the new problem's context: old problem and its turns are gone
         sent = seen_prompts[-1]
@@ -122,10 +117,8 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         send(client, sid, "more detail")
         script.append(analysis("keep", "Servers no-show constantly", facts=["3 no-shows a month", "Fridays worst"]))
         events = send(client, sid, "Fridays are the worst")
-        assert "tools" in [e for e, _ in events]
-        tools = wait_for_tools(client, sid)
-        assert "Servers no-show" in tools["result"]["for"]
-        assert len(tool_calls) >= 4
+        assert "tools" not in [e for e, _ in events]
+        assert len(tool_calls) == 0
 
         session = client.get(f"/chat/sessions/{sid}").json()
         assert session["problem"] == "Servers no-show constantly"
@@ -133,17 +126,15 @@ def test_problem_switch_replaces_problem_and_reruns_tools(fake_llm):
         assert any(m.get("type") == "problem_changed" for m in session["messages"])
 
 
-def test_each_message_refreshes_tools_without_clarity_gate(fake_llm):
+def test_each_message_updates_problem_without_researching_tools(fake_llm):
     script, tool_calls, _ = fake_llm
     with TestClient(app) as client:
         sid = client.post("/chat/sessions").json()["session_id"]
         script.append(analysis("new_problem", "Slow ticket times"))
         events = send(client, sid, "tickets take 40 min")
         names = [e for e, _ in events]
-        assert "tools" in names and "notice" in names
-        assert names.index("notice") < next(i for i, e in enumerate(names) if e == "token")
-        wait_for_tools(client, sid)
-        assert len(tool_calls) == 1
+        assert "tools" not in names and "notice" not in names
+        assert len(tool_calls) == 0
 
 
 def test_new_problem_is_re_evaluated_on_every_message(fake_llm):
@@ -158,12 +149,8 @@ def test_new_problem_is_re_evaluated_on_every_message(fake_llm):
             events = send(client, sid, msg)
             assert first_state(events)["action"] == "new_problem"
             assert first_state(events)["problem"] == "Owner describes seats/POS"
-        assert "tools" in [e for e, _ in events]
-        wait_for_tools(client, sid)
-        assert len(tool_calls) == 3
-        assert "Traffic is down 50%" in tool_calls[0][0]
-        assert "detail 0" in tool_calls[1][0]
-        assert "detail 1" in tool_calls[-1][0]
+        assert "tools" not in [e for e, _ in events]
+        assert len(tool_calls) == 0
 
 
 def test_turn_starts_with_thinking_status(fake_llm):

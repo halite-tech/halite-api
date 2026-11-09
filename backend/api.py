@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -212,6 +211,48 @@ async def context_report(
     return build_report(analyze(dataset), alpha)
 
 
+class ToolProblemIn(BaseModel):
+    problem: str = Field(..., min_length=1, max_length=4000)
+
+
+def _tool_stream(problems: list[str]) -> StreamingResponse:
+    async def events():
+        def chunk(event: str, data: dict) -> str:
+            return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+        updates = (
+            ("preparing", "Reading your business problem…", 10),
+            ("researching", "Searching vendor sites and product capabilities…", 35),
+            ("pricing", "Checking pricing, integrations, and restaurant fit…", 60),
+            ("ranking", "Comparing the strongest options…", 82),
+        )
+        yield chunk("progress", {"phase": updates[0][0], "message": updates[0][1], "progress": updates[0][2]})
+        task = asyncio.create_task(asyncio.to_thread(get_tools, problems))
+        index = 1
+        while not task.done():
+            await asyncio.sleep(2)
+            if task.done():
+                break
+            phase, message, progress = updates[index % len(updates)]
+            index += 1
+            yield chunk("progress", {"phase": phase, "message": message, "progress": progress})
+        try:
+            result = await task
+        except Exception as exc:
+            debug("api/tools", f"stream failed: {exc}")
+            yield chunk("error", {"message": f"Error getting tools: {exc}"})
+            return
+        yield chunk("progress", {"phase": "complete", "message": "Recommendations ready.", "progress": 100})
+        yield chunk("done", result)
+
+    return StreamingResponse(events(), media_type="text/event-stream", headers=SSE_HEADERS)
+
+
+@app.post("/context/tools/problem/stream")
+async def context_problem_tools_stream(body: ToolProblemIn):
+    return _tool_stream([body.problem.strip()])
+
+
 @app.get("/context/tools")
 def context_tools(alpha: float = Alpha, user_id: str = Depends(current_user_id)):
     report = _user_report(user_id, alpha)
@@ -223,16 +264,21 @@ def context_tools(alpha: float = Alpha, user_id: str = Depends(current_user_id))
 
 @app.post("/context/tools/stream")
 async def context_tools_stream(
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] | None = File(None),
     alpha: float = Form(DEFAULT_ALPHA),
     problem: str | None = Form(None),
 ):
-    raw = [(f.filename or "upload.csv", await f.read()) for f in files]
-    dataset = build_dataset(raw)
-    if not dataset.tables:
-        raise HTTPException(422, "none of the context files matched a known data type")
-    report = build_report(analyze(dataset), alpha)
-    problems = _problem_briefs_for_tools(report, problem)
+    if problem and problem.strip():
+        problems = [problem.strip()]
+    else:
+        raw = [(f.filename or "upload.csv", await f.read()) for f in (files or [])]
+        if not raw:
+            raise HTTPException(422, "at least one context file is required")
+        dataset = build_dataset(raw)
+        if not dataset.tables:
+            raise HTTPException(422, "none of the context files matched a known data type")
+        report = build_report(analyze(dataset), alpha)
+        problems = _problem_briefs_for_tools(report)
     if not problems:
         raise HTTPException(422, "no confident top problems to research")
 
@@ -405,21 +451,13 @@ def _analysis_for_dataset(dataset_id: str, user_id: str | None = None) -> Analys
 
 def _problem_briefs_for_tools(report: dict, selected_problem: str | None = None) -> list[str]:
     briefs: list[str] = []
-    def normalized(value: object) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    if selected_problem and selected_problem.strip():
+        return [selected_problem.strip()]
 
-    selected = normalized(selected_problem)
     candidates = report.get("top_problems") or []
-    if not selected:
-        candidates = candidates[:2]
+    candidates = candidates[:2]
     for p in candidates:
         label = (p.get("label") or p.get("category") or "Problem").strip()
-        if selected:
-            candidates = {normalized(label), normalized(p.get("category"))}
-            if selected not in candidates and not any(
-                selected in candidate or candidate in selected for candidate in candidates if candidate
-            ):
-                continue
         summary = (p.get("summary") or "").strip()
         briefs.append(f"{label}: {summary}" if summary else label)
     return briefs
