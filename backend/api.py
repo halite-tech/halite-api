@@ -25,6 +25,7 @@ from backend.chat_stream.service import problem_brief, run_turn
 from backend.ingest.dataset import Dataset, Profile
 from backend.ingest.loader import build_dataset
 from backend.ranker import DEFAULT_ALPHA, Analysis, analyze, build_report
+from backend.shared.industries import DEFAULT_INDUSTRY, INDUSTRY_LABELS
 from backend.shared.taxonomy import CATEGORIES
 from backend.synthetic.generate import generate
 from backend.shared.debug import debug, debug_trim
@@ -96,6 +97,11 @@ def taxonomy():
     return [c.to_dict() for c in CATEGORIES.values()]
 
 
+@app.get("/industries")
+def industries():
+    return [{"id": id_, "label": label} for id_, label in INDUSTRY_LABELS.items()]
+
+
 def _iso(ts) -> str | None:
     return None if ts is None else ts.isoformat()
 
@@ -140,9 +146,9 @@ def _user_dataset(user_id: str) -> Dataset:
     return ds
 
 
-def _user_report(user_id: str, alpha: float) -> dict:
+def _user_report(user_id: str, alpha: float, industry: str = DEFAULT_INDUSTRY) -> dict:
     ds = _user_dataset(user_id)
-    ANALYSES[user_id] = analyze(ds)
+    ANALYSES[user_id] = analyze(ds, industry=industry)
     return build_report(ANALYSES[user_id], alpha)
 
 
@@ -193,14 +199,19 @@ def delete_context_files(filenames: list[str], user_id: str = Depends(current_us
 
 
 @app.post("/context/analyze")
-def analyze_context(alpha: float = Alpha, user_id: str = Depends(current_user_id)):
-    return _user_report(user_id, alpha)
+def analyze_context(
+    alpha: float = Alpha,
+    industry: str = Query(DEFAULT_INDUSTRY),
+    user_id: str = Depends(current_user_id),
+):
+    return _user_report(user_id, alpha, industry)
 
 
 @app.post("/context/report")
 async def context_report(
     files: list[UploadFile] = File(...),
     alpha: float = Form(DEFAULT_ALPHA),
+    industry: str = Form(DEFAULT_INDUSTRY),
 ):
     raw = [(f.filename or "upload.csv", await f.read()) for f in files]
     if not raw:
@@ -208,7 +219,7 @@ async def context_report(
     dataset = build_dataset(raw)
     if not dataset.tables:
         raise HTTPException(422, "none of the context files matched a known data type")
-    return build_report(analyze(dataset), alpha)
+    return build_report(analyze(dataset, industry=industry), alpha)
 
 
 class ToolProblemIn(BaseModel):
@@ -547,17 +558,18 @@ def demo_tools(alpha: float = Alpha):
 # --------------------------------------------------------------------------- grill-me chat
 class ChatSessionIn(BaseModel):
     dataset_id: str | None = Field(None, description="analysed dataset (or 'demo') to ground the grilling in")
+    industry: str = Field(DEFAULT_INDUSTRY, min_length=1, max_length=64)
 
 
 class ChatMessageIn(BaseModel):
     message: str = Field(..., min_length=1, max_length=4000)
 
 
-def _chat_context(dataset_id: str | None, user_id: str) -> str | None:
+def _chat_context(dataset_id: str | None, user_id: str, industry: str = DEFAULT_INDUSTRY) -> str | None:
     if not dataset_id:
         if not load_user_files(user_id)[1]:
             return None
-        analysis = analyze(_user_dataset(user_id))
+        analysis = analyze(_user_dataset(user_id), industry=industry)
         rep = build_report(analysis)
         return "\n".join([f"Restaurant: {rep['restaurant']['name']}"] + [f"- {p['summary']}" for p in rep["top_problems"]])
     if dataset_id != "demo" and dataset_id not in ANALYSES and dataset_id in DATASETS:
@@ -582,7 +594,8 @@ def _chat_session_or_404(session_id: str, user_id: str) -> chat_sessions.ChatSes
 @app.post("/chat/sessions")
 def create_chat_session(body: ChatSessionIn | None = None, user_id: str = Depends(current_user_id)):
     dataset_id = body.dataset_id if body and body.dataset_id else None
-    session = chat_sessions.create_session(_chat_context(dataset_id, user_id), owner_id=user_id)
+    industry = body.industry if body else DEFAULT_INDUSTRY
+    session = chat_sessions.create_session(_chat_context(dataset_id, user_id, industry), owner_id=user_id)
     debug(
         "api/chat",
         f"POST /chat/sessions -> session_id={session.id} dataset_id={dataset_id!r} "

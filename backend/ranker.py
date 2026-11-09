@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from backend.cost_engine.engine import CostResult, run_cost_engine
 from backend.ingest.dataset import Dataset
 from backend.shared.benchmarks import SCENARIOS, Benchmarks
+from backend.shared.industries import DEFAULT_INDUSTRY, normalize_industry
 from backend.shared.models import weighted_confidence
 from backend.shared.taxonomy import CATEGORIES, DOMAIN_LABELS
 from backend.time_engine.engine import TimeEngineResult, run_time_engine
@@ -26,9 +27,13 @@ class Analysis:
     time: TimeEngineResult
 
 
-def analyze(ds: Dataset, bm: Benchmarks | None = None) -> Analysis:
+def analyze(
+    ds: Dataset,
+    bm: Benchmarks | None = None,
+    industry: str = DEFAULT_INDUSTRY,
+) -> Analysis:
     bm = bm or Benchmarks.load()
-    return Analysis(ds, run_cost_engine(ds, bm), run_time_engine(ds, bm))
+    return Analysis(ds, run_cost_engine(ds, bm, industry), run_time_engine(ds, bm))
 
 
 def pain_scores(a: Analysis, alpha: float, scenario: str = "typical") -> dict[str, float]:
@@ -161,6 +166,7 @@ def build_report(a: Analysis, alpha: float = DEFAULT_ALPHA) -> dict:
             "period_end": ds.period_end.strftime("%Y-%m-%d") if ds.period_end is not None else None,
             "period_days": ds.period_days,
         },
+        "industry": normalize_industry(a.cost.industry),
         "alpha": alpha,
         "top_problems": top,
         "all_problems": problems,

@@ -8,6 +8,7 @@ from backend.cost_engine.aggregate import CategoryCost, Finding, aggregate
 from backend.cost_engine.detectors import REGISTRY, Detector
 from backend.ingest.dataset import Dataset, MissingData
 from backend.shared.benchmarks import SCENARIOS, Benchmarks
+from backend.shared.industries import DEFAULT_INDUSTRY, category_multiplier, normalize_industry
 from backend.shared.metrics import annual_revenue
 from backend.shared.models import Skipped, normalize_weights
 
@@ -20,11 +21,13 @@ class CostResult:
     skipped: list[Skipped]
     categories: dict[str, CategoryCost]
     annual_revenue: float | None
+    industry: str = DEFAULT_INDUSTRY
 
     def weights(self, scenario: str = "typical") -> dict[str, float]:
         """cost_weight = adjusted cost / sum of adjusted costs."""
         return normalize_weights({
             c: cat.scenario_annual[scenario] * cat.confidence * cat.addressability
+            * category_multiplier(self.industry, c)
             for c, cat in self.categories.items()
         })
 
@@ -63,10 +66,15 @@ def run_detector(det: Detector, ds: Dataset, bm: Benchmarks) -> Finding | Skippe
     )
 
 
-def run_cost_engine(ds: Dataset, bm: Benchmarks | None = None) -> CostResult:
+def run_cost_engine(
+    ds: Dataset,
+    bm: Benchmarks | None = None,
+    industry: str = DEFAULT_INDUSTRY,
+) -> CostResult:
     bm = bm or Benchmarks.load()
+    industry = normalize_industry(industry)
     findings, skipped = [], []
     for det in REGISTRY:
         out = run_detector(det, ds, bm)
         (findings if isinstance(out, Finding) else skipped).append(out)
-    return CostResult(findings, skipped, aggregate(findings, bm), annual_revenue(ds))
+    return CostResult(findings, skipped, aggregate(findings, bm), annual_revenue(ds), industry)
