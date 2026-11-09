@@ -339,11 +339,11 @@ async def context_tools_stream(
 
 @app.get("/datasets")
 def list_datasets(user_id: str = Depends(current_user_id)):
-    """List the current user's durably stored uploads, plus whether analyze has run.
+    """List the current user's in-process uploads, plus whether analyze has run.
 
-    Uploaded files and profiles are restored from SQLite when the server starts. Analysis
-    results remain in memory and are rebuilt on demand after a restart. `demo` is listed
-    only after `/demo` (or tools/chat with dataset_id=demo) has built the synthetic analysis.
+    Uploads are compatibility support for API clients; the current web app stores context
+    in browser IndexedDB and posts files directly for each analysis. `demo` is listed only
+    after `/demo` (or tools/chat with dataset_id=demo) has built the synthetic analysis.
     """
     items = [_dataset_summary(i, ds) for i, ds in DATASETS.items() if DATASET_OWNERS.get(i) == user_id]
     if _demo_analysis.cache_info().currsize:

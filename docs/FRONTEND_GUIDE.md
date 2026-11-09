@@ -103,7 +103,10 @@ Point judges at fields that come from **their** upload:
 
 ## Stage 1 — `POST /uploads` (build dataset **here**)
 
-**This is the only step that runs ingest / `build_dataset`.** The uploaded files and profile are stored in SQLite. On restart, the backend reloads them into the in-memory `Dataset`; analyze does not re-read the original browser upload.
+**This is the only step that runs ingest / `build_dataset`.** The legacy upload route keeps
+files and profile in process memory only. The current web app stores context files in
+browser IndexedDB and posts them directly to the analysis endpoints, so no backend
+persistent volume is required.
 
 **Request:** `multipart/form-data`
 
